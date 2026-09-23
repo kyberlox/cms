@@ -8,7 +8,7 @@
 -include .env
 export
 
-COMPOSE   := docker compose
+COMPOSE   := docker-compose
 DC        := $(COMPOSE) -f docker-compose.yaml
 DCD       := $(COMPOSE) -f docker-compose.dev.yaml
 
