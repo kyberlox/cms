@@ -337,6 +337,18 @@ def setup_themes(
                 for key in ("overrides", "resolutions"):
                     if key in src_pkg:
                         minimal_root[key] = src_pkg[key]
+                # npm "$<name>" override references are resolved against the
+                # dependencies of the SAME package.json. The minimal root above
+                # drops the React devDependencies that the saved overrides
+                # reference ("react": "$react", ...), which makes `npm install`
+                # fail with "Unable to resolve reference $react". Re-declare the
+                # referenced packages so the overrides resolve exactly like they
+                # do in the source workspace root.
+                for _dep in ("react", "react-dom", "@emotion/react", "@emotion/styled"):
+                    if _dep in src_pkg.get("devDependencies", {}):
+                        minimal_root.setdefault("devDependencies", {})[_dep] = src_pkg[
+                            "devDependencies"
+                        ][_dep]
             root_pkg_path = os.path.join(data_dir, "package.json")
             with open(root_pkg_path, "w") as f:
                 json.dump(minimal_root, f, indent=2)

@@ -8,13 +8,13 @@
 -include .env
 export
 
-COMPOSE   := docker-compose
+COMPOSE   := docker compose
 DC        := $(COMPOSE) -f docker-compose.yaml
 DCD       := $(COMPOSE) -f docker-compose.dev.yaml
 
 STAGING_FLAG := $(if $(filter true,$(CERTBOT_STAGING)),--staging,)
 
-.PHONY: help setup setup-git \
+.PHONY: help setup setup-git env-file \
         dev dev-build dev-up dev-down dev-restart dev-rebuild dev-ps \
         dev-logs dev-logs-deepsel dev-logs-db dev-logs-nginx \
         deploy up build down restart restart-deepsel rebuild ps migrate exec \
@@ -22,12 +22,36 @@ STAGING_FLAG := $(if $(filter true,$(CERTBOT_STAGING)),--staging,)
         bootstrap-cert ssl-init ssl-renew \
         commit push pull git-status git-log
 
+# Generates .env from .env.example on first run, filling in random secrets.
+# Fully optional — deploy/dev do it automatically when .env is missing.
+env-file:
+	@if [ ! -f .env ]; then \
+		echo "[make] .env not found — creating it from .env.example with random secrets."; \
+		cp .env.example .env; \
+		SECRET=$$(openssl rand -hex 32); \
+		PGPW=$$(openssl rand -hex 16); \
+		ADMPW=$$(openssl rand -base64 12 | tr -d '/+=' | head -c 16); \
+		sed -i "s|CHANGE_ME_64_hex_chars|$$SECRET|" .env; \
+		sed -i "s|CHANGE_ME_postgres|$$PGPW|g" .env; \
+		sed -i "s|CHANGE_ME_admin|$$ADMPW|" .env; \
+		echo "[make] Added to .env (get them here if you forget):"; \
+		grep -E "APP_SECRET|POSTGRES_PASSWORD|DB_PASSWORD|DS_ADMIN" .env | sed 's/=.*/=<generated>/'; \
+		echo "[make] >>> Не забудьте записать логин/пароль админки: see DS_ADMIN_USERNAME / DS_ADMIN_PASSWORD in .env"; \
+	else \
+		echo "[make] .env already exists."; \
+	fi
+
 help:
 	@echo "Deepsel CMS — available commands"
 	@echo "=============================================================="
 	@echo ""
+	@echo "Quick start (no-code):"
+	@echo "  make deploy           Build + start the server. First run generates .env automatically."
+	@echo "  make ssl-init         (optional) Get a real Let's Encrypt certificate for \$$(DOMAIN)."
+	@echo "  make logs-deepsel     Follow backend logs (first boot builds the site: minutes)."
+	@echo ""
 	@echo "Setup:"
-	@echo "  make setup            Create .env from .env.example + configure git remote"
+	@echo "  make setup            Ensure .env (generate secrets) + configure git remote"
 	@echo "  make setup-git        (Re)set your git remote from GIT_REMOTE in .env"
 	@echo ""
 	@echo "Development (docker-compose.dev.yaml, project 'deepsel-dev'):"
@@ -74,9 +98,7 @@ help:
 
 # ------------------------------------------------------------------- Setup
 setup:
-	@test -f .env || cp .env.example .env
-	@echo "[make] .env is ready."
-	@echo "[make] Generated credentials live in .env (DS_ADMIN_PASSWORD, POSTGRES_PASSWORD, APP_SECRET)."
+	@$(MAKE) env-file
 	@$(MAKE) setup-git
 
 setup-git:
@@ -93,7 +115,7 @@ dev-build:
 	$(DCD) build
 
 dev:
-	@test -f .env || (echo "[make] No .env — run 'make setup' first."; exit 1)
+	@$(MAKE) env-file
 	$(DCD) up -d --build
 
 dev-up:
@@ -125,12 +147,12 @@ dev-logs-nginx:
 
 # ------------------------------------------------------------------- Deploy
 deploy:
-	@test -f .env || (echo "[make] No .env — run 'make setup' first."; exit 1)
-	@test -n "$(DOMAIN)" || (echo "[make] DOMAIN is empty in .env."; exit 1)
+	@$(MAKE) env-file
 	@$(MAKE) bootstrap-cert
 	$(DC) up -d --build
 	@echo "[make] Stack started. Open: https://$(DOMAIN)"
-	@echo "[make] Use 'make ssl-init' to replace the bootstrap cert with a real Let's Encrypt one."
+	@echo "[make] First boot builds the site (see 'make logs-deepsel'); takes a few minutes."
+	@echo "[make] For a trusted Let's Encrypt certificate run: make ssl-init"
 
 build:
 	$(DC) build

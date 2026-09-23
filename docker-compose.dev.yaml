@@ -5,17 +5,16 @@ services:
   db:
     image: postgres:16-alpine
     restart: unless-stopped
-    env_file: .env
     environment:
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-deepsel}
+      POSTGRES_USER: ${POSTGRES_USER:-deepsel}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-deepsel}
     ports:
       - "5432:5432" # expose for local tools (psql, DBeaver, ...)
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-deepsel} -d ${POSTGRES_DB:-deepsel}"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -28,14 +27,25 @@ services:
       dockerfile: Dockerfile
     image: deepsel:dev
     restart: unless-stopped
-    env_file: .env
+    env_file:
+      - path: .env
+        required: false
     environment:
+      # Forced: inside compose the DB always lives at `db:5432`.
+      DB_HOST: db
+      DB_PORT: "5432"
       # Dev overrides — see .env.example for the prod values.
       RUN_MIGRATIONS: "true"
       UVICORN_ARGS: "--reload"
-      FRONTEND_URL: "http://localhost:8080"
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:8080}
       CORS_ALLOWED_ORIGINS: "http://localhost:8080,http://localhost:5173"
       SESSION_COOKIE_SECURE: "false"
+      DB_NAME: ${DB_NAME:-deepsel}
+      DB_USER: ${DB_USER:-deepsel}
+      DB_PASSWORD: ${DB_PASSWORD:-deepsel}
+      APP_SECRET: ${APP_SECRET:-change-me-in-.env}
+      INSTALLED_APPS: ${INSTALLED_APPS:-core,cms}
+      APP_DIRS: ${APP_DIRS:-apps,deepsel.apps}
     depends_on:
       db:
         condition: service_healthy

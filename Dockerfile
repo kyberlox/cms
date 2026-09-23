@@ -52,6 +52,7 @@ RUN pip install --no-cache-dir -e ".[cms,server,storage,redis]"
 # Infra helper scripts.
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY docker/set_admin.py /usr/local/bin/set_admin.py
+COPY docker/db_ensure.py /usr/local/bin/db_ensure.py
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # 8000 = FastAPI backend, 4321 = Astro client spawned by the backend.
