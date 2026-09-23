@@ -1,0 +1,386 @@
+from typing import Any, Callable, Optional, Type, Union
+from pydantic import BaseModel
+from deepsel.utils.generate_crud_schemas import (
+    generate_create_schema,
+    generate_update_schema,
+)
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    HTTPException,
+    UploadFile,
+    status,
+    Query,
+)
+from fastapi.responses import StreamingResponse
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+from deepsel.orm import (
+    DeleteResponse,
+    OrderByCriteria,
+    SearchQuery,
+    BulkDeleteResponse,
+)
+from deepsel.orm.types import CsvImportResponse
+from deepsel.utils.models_pool import models_pool
+
+PAGINATION = dict[str, int | None]
+
+
+def _pagination_factory(max_results: int | None = None):
+    def pagination(skip: int = 0, limit: int | None = max_results):
+        return {"skip": skip, "limit": limit}
+
+    return pagination
+
+
+CALLABLE = Callable[..., Any]
+CALLABLE_LIST = Callable[..., list[Any]]
+CALLABLE_DICT = Callable[..., dict]
+
+
+class CRUDRouter(APIRouter):
+    def __init__(
+        self,
+        table_name: str,
+        # schemas
+        read_schema: Type[BaseModel],
+        search_schema: Optional[Type[BaseModel]] = None,
+        create_schema: Optional[Type[BaseModel]] = None,
+        update_schema: Optional[Type[BaseModel]] = None,
+        # optional configs
+        prefix: Optional[str] = None,
+        tags: Optional[list[str]] = None,
+        paginate: Optional[int] = None,
+        # enable or disable routes
+        get_all_route: Union[bool, list] = False,
+        get_one_route: Union[bool, list] = True,
+        create_route: Union[bool, list] = True,
+        update_route: Union[bool, list] = True,
+        delete_one_route: Union[bool, list] = True,
+        delete_all_route: Union[bool, list] = False,
+        bulk_delete_route: Union[bool, list] = True,
+        search_route: Union[bool, list] = True,
+        export_route: Union[bool, list] = True,
+        import_route: Union[bool, list] = True,
+        **kwargs: Any,
+    ) -> None:
+        from deepsel.deps import settings, get_db
+        from deepsel.auth.get_current_user import get_current_user
+
+        if get_db is None:
+            raise RuntimeError(
+                "Consumer dependencies not configured. Call deepsel.deps.configure_deps() at app startup."
+            )
+
+        self.db_model = models_pool[table_name]
+        self.get_db = get_db
+        self.get_current_user = get_current_user
+        self.schema = read_schema
+        self.create_schema = (
+            create_schema if create_schema else generate_create_schema(self.db_model)
+        )
+        self.update_schema = (
+            update_schema if update_schema else generate_update_schema(self.db_model)
+        )
+
+        # pk detection
+        self._pk = "id"
+        if self._pk in read_schema.model_fields:
+            self._pk_type = read_schema.model_fields[self._pk].annotation
+        else:
+            self._pk_type = int
+
+        self.pagination = Depends(_pagination_factory(paginate))
+
+        prefix = str(prefix if prefix else table_name).lower()
+        prefix = f"{settings.API_PREFIX}/{prefix.strip('/')}"
+        if not tags:
+            tags = [table_name.title()]
+
+        super().__init__(prefix=prefix, tags=tags, **kwargs)
+
+        # Register specific paths before parameterized paths
+        if search_route:
+            self._add_api_route(
+                "/search",
+                self._search(),
+                methods=["POST"],
+                response_model=search_schema or dict,  # type: ignore
+                summary="Search",
+                dependencies=search_route,
+            )
+
+        if bulk_delete_route:
+            self._add_api_route(
+                "/bulk_delete",
+                self._bulk_delete(),
+                methods=["POST"],
+                response_model=BulkDeleteResponse,
+                summary="Bulk Delete",
+                dependencies=bulk_delete_route,
+            )
+
+        if export_route:
+            self._add_api_route(
+                "/export",
+                self._get_export(),
+                methods=["POST"],
+                summary="Export CSV",
+                dependencies=export_route,
+            )
+
+        if import_route:
+            self._add_api_route(
+                "/import",
+                self._import_records(),
+                methods=["POST"],
+                response_model=CsvImportResponse,
+                summary="Import CSV",
+                dependencies=import_route,
+            )
+
+        if get_all_route:
+            self._add_api_route(
+                "",
+                self._get_all(),
+                methods=["GET"],
+                response_model=list[read_schema],  # type: ignore
+                summary="Get All",
+                dependencies=get_all_route,
+            )
+
+        if create_route:
+            self._add_api_route(
+                "",
+                self._create(),
+                methods=["POST"],
+                response_model=read_schema,
+                summary="Create One",
+                dependencies=create_route,
+            )
+
+        if get_one_route:
+            self._add_api_route(
+                "/{item_id}",
+                self._get_one(),
+                methods=["GET"],
+                response_model=read_schema,
+                summary="Get One",
+                dependencies=get_one_route,
+            )
+
+        if update_route:
+            self._add_api_route(
+                "/{item_id}",
+                self._update(),
+                methods=["PUT"],
+                response_model=read_schema,
+                summary="Update One",
+                dependencies=update_route,
+            )
+
+        if delete_one_route:
+            self._add_api_route(
+                "/{item_id}",
+                self._delete_one(),
+                methods=["DELETE"],
+                response_model=DeleteResponse,
+                summary="Delete One",
+                dependencies=delete_one_route,
+            )
+
+    def _add_api_route(
+        self,
+        path: str,
+        endpoint: Callable,
+        methods: list[str],
+        response_model: Any = None,
+        summary: str = "",
+        dependencies: Union[bool, list] = True,
+    ) -> None:
+        if dependencies is False:
+            return
+        deps = dependencies if isinstance(dependencies, list) else []
+        self.add_api_route(
+            path,
+            endpoint,
+            methods=methods,
+            response_model=response_model,
+            summary=summary,
+            dependencies=deps,
+        )
+
+    def _raise(self, e: Exception) -> None:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    def _search(self, *args: Any, **kwargs: Any) -> CALLABLE_DICT:
+        def route(
+            db: Session = Depends(self.get_db),
+            user=Depends(self.get_current_user),
+            pagination: PAGINATION = self.pagination,
+            search: Optional[SearchQuery] = None,
+            order_by: Optional[OrderByCriteria] = None,
+        ) -> dict:
+            return self.db_model.search(db, user, pagination, search, order_by)
+
+        return route
+
+    def _get_all(self, *args: Any, **kwargs: Any) -> CALLABLE_LIST:
+        def route(
+            db: Session = Depends(self.get_db),
+            user=Depends(self.get_current_user),
+            pagination: PAGINATION = self.pagination,
+        ) -> list[Any]:
+            return self.db_model.get_all(db, user, pagination)
+
+        return route
+
+    def _get_one(self, *args: Any, **kwargs: Any) -> CALLABLE:
+        def route(
+            item_id: self._pk_type,
+            db: Session = Depends(self.get_db),
+            user=Depends(self.get_current_user),
+        ) -> Any:
+            model = self.db_model.get_one(db, user, item_id)
+            if model:
+                return model
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail="Not Found"
+                ) from None
+
+        return route
+
+    def _create(self, *args: Any, **kwargs: Any) -> CALLABLE:
+        def route(
+            model: self.create_schema,  # type: ignore
+            background_tasks: BackgroundTasks,
+            db: Session = Depends(self.get_db),
+            user=Depends(self.get_current_user),
+            external_username: Optional[str] = None,
+        ) -> Any:
+            try:
+                return self.db_model.create(
+                    db,
+                    user,
+                    model.dict(),
+                    background_tasks=background_tasks,
+                    external_username=external_username,
+                )
+            except Exception:
+                db.rollback()
+                raise
+
+        return route
+
+    def _update(self, *args: Any, **kwargs: Any) -> CALLABLE:
+        def route(
+            item_id: self._pk_type,  # type: ignore
+            model: self.update_schema,  # type: ignore
+            background_tasks: BackgroundTasks,
+            db: Session = Depends(self.get_db),
+            user=Depends(self.get_current_user),
+            external_username: Optional[str] = None,
+        ) -> Any:
+            try:
+                db_model = db.query(self.db_model).get(item_id)
+                if db_model is None:
+                    # RB-16: without this the next line calls `.update()` on
+                    # None and the route answers 500 instead of 404.
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND, detail="Not Found"
+                    )
+                return db_model.update(
+                    db,
+                    user,
+                    model.dict(exclude={self._pk}, exclude_unset=True),
+                    background_tasks=background_tasks,
+                    external_username=external_username,
+                )
+            except IntegrityError as e:
+                db.rollback()
+                self._raise(e)
+
+        return route
+
+    def _delete_one(self, *args: Any, **kwargs: Any) -> CALLABLE:
+        def route(
+            item_id: self._pk_type,
+            background_tasks: BackgroundTasks,
+            db: Session = Depends(self.get_db),
+            user=Depends(self.get_current_user),
+            force: Optional[bool] = False,
+        ) -> DeleteResponse:
+            db_model = db.query(self.db_model).get(item_id)
+            if not db_model:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail="Record not found"
+                )
+            res = db_model.delete(
+                db, user, force=force, background_tasks=background_tasks
+            )
+            return res
+
+        return route
+
+    def _get_export(
+        self, *args: Any, **kwargs: Any
+    ) -> Callable[..., StreamingResponse]:
+        def route(
+            db: Session = Depends(self.get_db),
+            user=Depends(self.get_current_user),
+            pagination: PAGINATION = self.pagination,
+            search: Optional[SearchQuery] = None,
+            order_by: Optional[OrderByCriteria] = None,
+        ) -> StreamingResponse:
+            result = self.db_model.export(db, user, pagination, search, order_by)
+            csv_text = result.getvalue()
+            if self.db_model.csv_export_bom:
+                csv_bytes = b"\xef\xbb\xbf" + csv_text.encode("utf-8")
+            else:
+                csv_bytes = csv_text.encode("utf-8")
+            filename = f"{self.db_model.__tablename__}.csv"
+            response = StreamingResponse(
+                iter([csv_bytes]),
+                media_type="text/csv",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "Access-Control-Expose-Headers": "Content-Disposition",
+                },
+            )
+            return response
+
+        return route
+
+    def _import_records(self, *args: Any, **kwargs: Any) -> Callable:
+        def route(
+            background_tasks: BackgroundTasks,
+            db: Session = Depends(self.get_db),
+            user=Depends(self.get_current_user),
+            file: UploadFile = File(...),
+            dry_run: bool = Query(default=False),
+        ) -> CsvImportResponse:
+            result = self.db_model.import_records(
+                db,
+                user,
+                file,
+                dry_run=dry_run,
+                background_tasks=background_tasks,
+            )
+            return result
+
+        return route
+
+    def _bulk_delete(self, *args: Any, **kwargs: Any) -> Callable:
+        def route(
+            db: Session = Depends(self.get_db),
+            user=Depends(self.get_current_user),
+            search: Optional[SearchQuery] = None,
+            force: Optional[bool] = Query(default=False),
+        ) -> dict:
+            return self.db_model.bulk_delete(db, user, search, force)
+
+        return route

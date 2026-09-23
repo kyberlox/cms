@@ -1,0 +1,113 @@
+import enum
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Optional, Type
+
+from pydantic import BaseModel as PydanticModel, ConfigDict, Field
+
+# Type alias replacing fastapi_crudrouter's PAGINATION
+PAGINATION = dict[str, int | None]
+
+
+class RelationshipRecordCollection(PydanticModel):
+    relationship_name: str
+    linked_records: list[dict[str, Any]] = []
+    linked_model_class: Any
+
+
+class Operator(str, enum.Enum):
+    eq = "="
+    ne = "!="
+    in_ = "in"
+    not_in = "not_in"
+    between = "between"
+    contains = "contains"
+    gt = ">"
+    gte = ">="
+    lt = "<"
+    lte = "<="
+    like = "like"
+    ilike = "ilike"
+
+
+class SearchCriteria(PydanticModel):
+    field: str
+    operator: Operator
+    value: str | int | float | datetime | list[str | int | float | datetime] | Any
+
+
+class SearchQuery(PydanticModel):
+    AND: Optional[list[SearchCriteria]] = []
+    OR: Optional[list[SearchCriteria]] = []
+
+
+class OrderDirection(str, enum.Enum):
+    asc = "asc"
+    desc = "desc"
+
+
+class OrderByCriteria(PydanticModel):
+    field: str
+    direction: OrderDirection = "asc"
+    # Optional request-scoped context (e.g. the caller's current UI locale) that a
+    # model's _resolve_computed_order_by hook can use to build a computed sort
+    # expression for fields with no direct column. Ignored by the default
+    # column-lookup resolution.
+    context: Optional[dict[str, Any]] = None
+
+
+class PermissionScope(str, enum.Enum):
+    none = "none"
+    own = "own"
+    org = "org"
+    all = "*"
+
+
+class PermissionAction(str, enum.Enum):
+    read = "read"
+    write = "write"
+    delete = "delete"
+    create = "create"
+    all = "*"
+
+
+class DeleteResponse(PydanticModel):
+    success: bool
+
+
+class BulkDeleteResponse(DeleteResponse):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    deleted_count: int = 0
+    deleted_records: list[Any] = Field(default_factory=list, exclude=True)
+
+
+class CRUDSchema(PydanticModel):
+    Read: Type[PydanticModel]
+    Create: Type[PydanticModel]
+    Update: Type[PydanticModel]
+    Search: Type[PydanticModel]
+
+
+class CsvImportRowError(PydanticModel):
+    row: int
+    message: str
+
+
+class CsvImportResponse(PydanticModel):
+    success: bool
+    dry_run: bool = False
+    total: int = 0
+    created: int = 0
+    updated: int = 0
+    skipped: int = 0
+    error_count: int = 0
+    errors: list[CsvImportRowError] = Field(default_factory=list)
+    ignored_columns: list[str] = Field(default_factory=list)
+
+
+@dataclass
+class ServeResult:
+    redirect_url: Optional[str] = None
+    content: Optional[bytes] = None
+    content_type: str = "application/octet-stream"

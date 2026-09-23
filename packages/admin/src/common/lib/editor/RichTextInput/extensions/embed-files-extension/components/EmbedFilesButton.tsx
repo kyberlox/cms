@@ -1,0 +1,73 @@
+import React, { useState } from 'react';
+import type { Editor } from '@tiptap/core';
+import { IconFileText } from '@tabler/icons-react';
+import { Tooltip } from '@mantine/core';
+import { useTranslation } from 'react-i18next';
+import { MAX_FILES_COUNT, getEmbedFilesOptions } from '../utils';
+import FilesSelectorModal from './FilesSelectorModal';
+import type { EmbedFileItem } from '../types';
+import type { User } from '../../../../../types';
+
+interface EmbedFilesButtonProps {
+  editor: Editor | null;
+  backendHost: string;
+  user: User;
+  setUser: (user: User | null) => void;
+  children?: React.ReactNode;
+  /** Active editor locale ID — forwarded so fresh uploads tag the currently-active language, not always the site default. */
+  currentLocaleId?: number | null;
+}
+
+/**
+ * Button to insert files into the editor
+ *
+ * @constructor
+ */
+const EmbedFilesButton = ({
+  editor,
+  backendHost,
+  user,
+  setUser,
+  children,
+  currentLocaleId,
+}: EmbedFilesButtonProps) => {
+  const { t } = useTranslation();
+
+  const [isFilesSelectorModalOpened, setIsFilesSelectorModalOpened] = useState(false);
+  const [selectedFiles, setSelectedFiles] = useState<EmbedFileItem[]>([]);
+
+  /** Reads the same locale set via EmbedFiles.configure() in RichTextInput. */
+  const { locale } = getEmbedFilesOptions(editor);
+
+  return (
+    <>
+      <Tooltip label={t(`Insert files (max ${MAX_FILES_COUNT})`)}>
+        <button
+          type="button"
+          onClick={() => {
+            setSelectedFiles([]);
+            setIsFilesSelectorModalOpened(true);
+          }}
+          className="w-8 h-8 flex justify-center items-center rounded p-1 font-thin cursor-pointer hover:bg-[#e4e6ed]"
+        >
+          {children || <IconFileText size={22} className="text-[#808496]" />}
+        </button>
+      </Tooltip>
+
+      <FilesSelectorModal
+        backendHost={backendHost}
+        user={user}
+        setUser={setUser}
+        locale={locale}
+        currentLocaleId={currentLocaleId}
+        editor={editor}
+        opened={isFilesSelectorModalOpened}
+        setOpened={setIsFilesSelectorModalOpened}
+        selectedFiles={selectedFiles}
+        setSelectedFiles={setSelectedFiles}
+      />
+    </>
+  );
+};
+
+export default EmbedFilesButton;

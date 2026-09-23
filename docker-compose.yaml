@@ -1,0 +1,94 @@
+name: deepsel
+
+services:
+  # ------------------------------------------------------------------ PostgreSQL
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks: [default]
+
+  # ------------------------------------------------------------------- Deepsel
+  # FastAPI backend (8000) which ALSO builds and spawns the Astro CMS client
+  # (4321) inside the same container (see deepsel/apps/cms/utils/client_process.py).
+  deepsel:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: deepsel:latest
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      # Persistent data dir (platformdirs user_data_dir): built client,
+      # themes, org overlays. Keeps re-deploys from re-running npm install.
+      - deepsel-data:/root/.local/share/deepsel-cms
+      # FILESYSTEM=local attachment storage (deepsel/orm/attachment_mixin.py)
+      - deepsel-files:/app/files
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8000/api/v1/openapi.json', timeout=5)\"",
+        ]
+      interval: 30s
+      timeout: 10s
+      start_period: 900s
+      retries: 5
+    networks: [default]
+
+  # --------------------------------------------------------------------- nginx
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      - deepsel
+    environment:
+      # Rendered into /etc/nginx/conf.d/default.conf via the official image's
+      # envsubst-on-templates hook (nginx/prod.conf.template).
+      DOMAIN: ${DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/prod.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - certbot-www:/var/www/certbot:ro
+      - certbot-certs:/etc/letsencrypt:ro
+      - certbot-certs-data:/var/lib/letsencrypt:ro
+    networks: [default]
+
+  # ------------------------------------------------------------------- certbot
+  # Auto-renews certificates (checks every 12h). The FIRST certificate is
+  # obtained with `make ssl-init` (see Makefile / README).
+  certbot:
+    image: certbot/certbot:latest
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - certbot-www:/var/www/certbot
+      - certbot-certs:/etc/letsencrypt
+      - certbot-certs-data:/var/lib/letsencrypt
+    entrypoint: /bin/sh -c 'trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --non-interactive; sleep 12h & wait $${!}; done;'
+    networks: [default]
+
+volumes:
+  pgdata:
+  deepsel-data:
+  deepsel-files:
+  certbot-www:
+  certbot-certs:
+  certbot-certs-data:

@@ -1,0 +1,2544 @@
+import codecs
+import csv
+import enum
+import json
+import logging
+import traceback
+import os
+from datetime import UTC, datetime
+from io import StringIO, BytesIO
+from pathlib import Path
+from typing import Any, Optional
+
+from dateutil.parser import parse as parse_date
+from fastapi import File, HTTPException, status, UploadFile
+from decimal import Decimal, InvalidOperation
+from uuid import UUID as PyUUID
+
+from sqlalchemy import (
+    ARRAY,
+    JSON,
+    Boolean,
+    Column,
+    Date,
+    DateTime,
+    Enum,
+    Float,
+    Integer,
+    Numeric,
+    String,
+    and_,
+    false,
+    inspect,
+    or_,
+    func,
+    UUID,
+    PickleType,
+    LargeBinary,
+    MetaData,
+    Table,
+)
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.declarative import declared_attr
+from sqlalchemy.orm import Query, Session, RelationshipProperty
+
+from deepsel.orm.types import (
+    RelationshipRecordCollection,
+    SearchQuery,
+    OrderByCriteria,
+    PermissionScope,
+    PermissionAction,
+    DeleteResponse,
+    BulkDeleteResponse,
+    CsvImportRowError,
+    CsvImportResponse,
+    PAGINATION,
+)
+from deepsel.utils.check_delete_cascade import (
+    AffectedRecordResult,
+    get_delete_cascade_records_recursively,
+)
+from deepsel.utils.get_field_info import FieldInfo
+from deepsel.utils.get_relationships import (
+    get_one2many_parent_id,
+    get_relationships,
+)
+from deepsel.utils.models_pool import models_pool
+
+logger = logging.getLogger(__name__)
+
+
+def _get_relationships_class_map(model) -> dict:
+    """Get a map of relationship name -> related model class."""
+    relationships = {}
+    for relationship in model.__mapper__.relationships:
+        relationships[relationship.key] = relationship.mapper.class_
+    return relationships
+
+
+def _integrity_error_detail(e: IntegrityError) -> str:
+    orig = getattr(e, "orig", None)
+    if orig is not None:
+        diag = getattr(orig, "diag", None)
+        if diag is not None:
+            detail = getattr(diag, "message_detail", None)
+            if detail:
+                return detail
+            primary = getattr(diag, "message_primary", None)
+            if primary:
+                return primary
+        return str(orig).split("\n")[0]
+    return str(e).split("\n")[0]
+
+
+def _check_m2m_permission(
+    user,
+    relationship,
+    linked_records: list,
+    action: "PermissionAction",
+    parent_instance=None,
+) -> None:
+    """
+    Gate many-to-many attach/detach by checking the secondary (join) table's
+    permission. Skips the check when the join table has no ORM model registered
+    in models_pool (preserves prior behavior for raw `secondary` Tables).
+
+    Scope semantics:
+      - `*`: allow.
+      - `org`: if the M2M target is `organization`, each linked org id must be
+        in the user's org list. Else if the parent record carries
+        `organization_id`, that must be in the user's org list. Else (neither
+        side carries org context, e.g. user_role) the check is permissive.
+      - `own`: each linked record must reference the actor (user.id).
+      - `none` / any other scope: deny.
+    """
+    secondary_table = getattr(relationship, "secondary", None)
+    if not secondary_table:
+        return
+    JoinModel = models_pool.get(secondary_table)
+    if JoinModel is None or not hasattr(JoinModel, "_check_has_permission"):
+        return
+
+    [allowed, scope] = JoinModel._check_has_permission(action, user)
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"You do not have permission to {action.value} "
+                f"{secondary_table} records"
+            ),
+        )
+
+    if scope == PermissionScope.all:
+        return
+
+    if scope not in (PermissionScope.org, PermissionScope.own):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"You do not have permission to {action.value} "
+                f"{secondary_table} records"
+            ),
+        )
+
+    user_org_ids = user.get_org_ids()
+
+    if scope == PermissionScope.org:
+        if relationship.table_name == "organization":
+            for record in linked_records:
+                target_id = record.get("id")
+                if target_id not in user_org_ids:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail=(
+                            f"You do not have permission to link "
+                            f"organization {target_id}"
+                        ),
+                    )
+            return
+        if parent_instance is not None and hasattr(parent_instance, "organization_id"):
+            parent_org_id = getattr(parent_instance, "organization_id", None)
+            if parent_org_id is not None and parent_org_id not in user_org_ids:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=(
+                        f"You do not have permission to modify "
+                        f"{secondary_table} for organization {parent_org_id}"
+                    ),
+                )
+            return
+        return
+
+    if scope == PermissionScope.own:
+        for record in linked_records:
+            if record.get("id") != getattr(user, "id", None):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=(
+                        f"You can only link your own {relationship.table_name} "
+                        f"records"
+                    ),
+                )
+        return
+
+
+class ORMBaseMixin(object):
+    __mapper__ = None
+
+    @declared_attr
+    def __tablename__(cls):
+        return cls.__name__.lower()
+
+    created_at = Column(DateTime, default=lambda x: datetime.now(UTC))
+    updated_at = Column(
+        DateTime,
+        default=lambda x: datetime.now(UTC),
+        onupdate=lambda x: datetime.now(UTC),
+    )
+    string_id = Column(String, unique=True)
+    system = Column(Boolean, default=False)
+    active = Column(Boolean, default=True)
+
+    csv_export_exclude: set[str] = set()
+    csv_export_bom: bool = True
+    csv_import_readonly_columns: set[str] = {
+        "created_at",
+        "updated_at",
+        "owner_id",
+        "organization_id",
+        "system",
+    }
+    csv_import_max_errors: int = 100
+
+    @classmethod
+    def csv_export_columns(cls) -> list[str]:
+        model = models_pool.get(cls.__tablename__, cls)
+        return [
+            c.name
+            for c in model.__table__.columns
+            if c.name not in cls.csv_export_exclude
+            and not isinstance(c.type, (LargeBinary, PickleType))
+        ]
+
+    @classmethod
+    def csv_import_columns(cls) -> list[str]:
+        return [
+            c
+            for c in cls.csv_export_columns()
+            if c not in cls.csv_import_readonly_columns
+        ]
+
+    @classmethod
+    def csv_import_match(cls, db, user, row, organization_id):
+        model = models_pool.get(cls.__tablename__, cls)
+        has_org = hasattr(model, "organization_id")
+        if row.get("id"):
+            q = db.query(model).filter_by(id=row["id"])
+            if has_org:
+                q = q.filter_by(organization_id=organization_id)
+            instance = q.first()
+            if instance:
+                return instance
+        if row.get("string_id"):
+            q = db.query(model).filter_by(string_id=row["string_id"])
+            if has_org:
+                q = q.filter_by(organization_id=organization_id)
+            instance = q.first()
+            if instance:
+                return instance
+        return None
+
+    def __repr__(self):
+        identifier = None
+        for key in ["name", "display_name", "title", "username", "email", "string_id"]:
+            if hasattr(self, key) and getattr(self, key) is not None:
+                identifier = getattr(self, key, None)
+                break
+
+        cls_name = self.__class__.__name__.replace("Model", "")
+
+        return f"<{cls_name}{': ' + identifier if identifier else ''} {' (id ' + str(self.id) + ')' if hasattr(self, 'id') else ''}>"
+
+    def __str__(self):
+        return self.__repr__()
+
+    def to_dict(self):
+        return {c.key: getattr(self, c.key) for c in inspect(self).mapper.column_attrs}
+
+    # =========================================================================
+    # Hook methods — override in subclasses for app-specific behavior
+    # =========================================================================
+
+    @classmethod
+    def _resolve_organization_on_create(
+        cls,
+        db: Session,
+        user,
+        values: dict,
+        bypass_permission: Optional[bool] = False,
+    ) -> dict:
+        """Resolve organization_id on create. Override for custom role/table logic.
+
+        Scope-aware: a user whose create scope is `*` may target any org
+        explicitly, a user scoped to `org` may target any org they belong to.
+        Anything else falls back to `user.current_organization_id` (populated by
+        the consumer's get_current_user dependency from the X-Organization-Id
+        header), then — in AUTHLESS mode, where there is no header to send — to
+        `settings.DEFAULT_ORG_ID` for users who may target it. Raises 400 when
+        none of those resolve.
+        """
+        if not hasattr(cls, "organization_id"):
+            return values
+
+        if cls.__tablename__ == "user":
+            return values
+
+        # When bypassing permission checks, organization_id is already resolved
+        # by the caller
+        if bypass_permission:
+            return values
+
+        requested_org_id = values.get("organization_id")
+
+        if requested_org_id:
+            [_, scope] = cls._check_has_permission(PermissionAction.create, user)
+
+            if scope == PermissionScope.all:
+                return values
+
+            if scope == PermissionScope.org:
+                if requested_org_id in user.get_org_ids():
+                    return values
+
+        current_org_id = getattr(user, "current_organization_id", None)
+
+        if current_org_id is None:
+            # AUTHLESS consumers run as the seeded admin_user and have no
+            # X-Organization-Id header to fall back on — use the default org.
+            from deepsel import deps
+
+            if getattr(deps.settings, "AUTHLESS", False):
+                default_org_id = getattr(deps.settings, "DEFAULT_ORG_ID", None)
+                # AUTHLESS=true is not proof that auth is off: it only takes
+                # effect when the default org's enable_auth is False. With auth
+                # actually enforced, silently dropping a header-less create into
+                # the default org would let a member of another org write into
+                # it. Gate on the same rule as an explicit organization_id —
+                # scope `*`, or membership — which the seeded admin_user of a
+                # genuinely authless install satisfies via its `*` scope, with
+                # no extra query.
+                if default_org_id is not None:
+                    [_, scope] = cls._check_has_permission(
+                        PermissionAction.create, user
+                    )
+                    if scope == PermissionScope.all or (
+                        scope == PermissionScope.org
+                        and default_org_id in user.get_org_ids()
+                    ):
+                        current_org_id = default_org_id
+
+        if current_org_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "X-Organization-Id header required to create "
+                    f"{cls.__tablename__}"
+                ),
+            )
+
+        values["organization_id"] = current_org_id
+        return values
+
+    @classmethod
+    def _check_model_write_permission(cls, instance, user) -> None:
+        """Additional write/delete permission check. Override for model-specific logic."""
+        pass
+
+    @classmethod
+    def create(
+        cls,
+        db: Session,
+        user,
+        values: dict,
+        commit: Optional[bool] = True,
+        bypass_permission: Optional[bool] = False,
+        *args,
+        **kwargs,
+    ) -> "[ORMBaseMixin]":
+        model = models_pool[cls.__tablename__]
+        if not bypass_permission:
+            [allowed, _] = model._check_has_permission(PermissionAction.create, user)
+            if not allowed:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"You do not have permission to create this resource type: {model.__tablename__}",
+                )
+
+        # if model has owner_id, only allow users to assign ownership to themselves
+        if hasattr(model, "owner_id") and user is not None:
+            values["owner_id"] = user.id
+
+        # delegate organization resolution to hook
+        values = cls._resolve_organization_on_create(
+            db, user, values, bypass_permission=bypass_permission
+        )
+
+        # for every value in the format of <table_name>/<string_id>, get the record instance
+        for key, value in values.items():
+            if isinstance(value, str) and value.count("/") == 1:
+                table_name, string_id = value.split("/")
+                RelatedModel = models_pool.get(table_name)
+                if RelatedModel:
+                    record = (
+                        db.query(RelatedModel).filter_by(string_id=string_id).first()
+                    )
+                    if record:
+                        values[key] = record.id
+                    else:
+                        logger.error(f"Error finding record with string_id: {value}")
+
+        relationships = get_relationships(model)
+        relationship_classes = _get_relationships_class_map(model)
+        m2m_by_name = {r.name: r for r in relationships.many2many}
+
+        many2many_records_to_link: list[RelationshipRecordCollection] = []
+        one2many_records_to_create: list[RelationshipRecordCollection] = []
+
+        # pop many2many relationship lists from values
+        for relationship in relationships.many2many:
+            if relationship.name in values:
+                linked_records = values.pop(relationship.name)
+                if linked_records:
+                    many2many_records_to_link.append(
+                        RelationshipRecordCollection(
+                            relationship_name=relationship.name,
+                            linked_records=linked_records,
+                            linked_model_class=relationship_classes[relationship.name],
+                        )
+                    )
+
+        # set attr for one2many relationships
+        for relationship in relationships.one2many:
+            if relationship.name in values:
+                linked_records = values.pop(relationship.name)
+                if linked_records:
+                    one2many_records_to_create.append(
+                        RelationshipRecordCollection(
+                            relationship_name=relationship.name,
+                            linked_records=linked_records,
+                            linked_model_class=relationship_classes[relationship.name],
+                        )
+                    )
+
+        try:
+            # check if field is defined in class, if not pop it
+            to_pop = []
+            for key, value in values.items():
+                if not hasattr(model, key):
+                    to_pop.append(key)
+            for key in to_pop:
+                values.pop(key)
+
+            instance = model(**values)
+            db.add(instance)
+
+            # now link many2many records
+            if many2many_records_to_link:
+                for collection in many2many_records_to_link:
+                    if not bypass_permission:
+                        _check_m2m_permission(
+                            user,
+                            m2m_by_name[collection.relationship_name],
+                            collection.linked_records,
+                            PermissionAction.create,
+                            parent_instance=instance,
+                        )
+                    LinkedModel = collection.linked_model_class
+                    ids = [record["id"] for record in collection.linked_records]
+                    record_instances = (
+                        db.query(LinkedModel).filter(LinkedModel.id.in_(ids)).all()
+                    )
+                    setattr(instance, collection.relationship_name, record_instances)
+
+            if commit:
+                db.commit()
+                db.refresh(instance)
+
+                # now create the one2many records
+                # since now we have the instance id after commit
+                if one2many_records_to_create:
+                    for collection in one2many_records_to_create:
+                        LinkedModel = collection.linked_model_class
+                        parent_key_field = get_one2many_parent_id(
+                            LinkedModel, model.__tablename__
+                        )
+                        if parent_key_field:
+                            for record_values in collection.linked_records:
+                                record_values[parent_key_field.name] = instance.id
+                                record_instance = LinkedModel.create(
+                                    db,
+                                    user,
+                                    record_values,
+                                    bypass_permission=bypass_permission,
+                                )
+                                db.add(record_instance)
+                    db.commit()
+
+            return instance
+        except IntegrityError as e:
+            if commit:
+                db.rollback()
+            detail = _integrity_error_detail(e)
+            logger.error(
+                f"Error creating record: {detail}\nFull traceback: {traceback.format_exc()}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Error creating record: {detail}",
+            )
+        except HTTPException as e:
+            if commit:
+                db.rollback()
+            raise e
+        except Exception:
+            if commit:
+                db.rollback()
+            logger.error(f"Error creating record: {traceback.format_exc()}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="An error occurred!",
+            )
+
+    def _can_process_with_scope(self, scope, user):
+        if scope == PermissionScope.all:
+            return True
+
+        user_org_ids = user.get_org_ids()
+
+        if scope == PermissionScope.own:
+            if hasattr(self, "owner_id") and self.owner_id == user.id:
+                return True
+            elif self.__tablename__ == "user" and self.id == user.id:
+                return True
+            elif self.__tablename__ == "organization":
+                resource_id = getattr(self, "id", None)
+                if resource_id in user_org_ids:
+                    return True
+
+        elif scope == PermissionScope.org:
+            if hasattr(self, "organization_id") and self.organization_id is not None:
+                if self.organization_id in user_org_ids:
+                    return True
+
+            if self.__tablename__ == "organization":
+                resource_id = getattr(self, "id", None)
+                if resource_id in user_org_ids:
+                    return True
+
+            if self.__tablename__ == "user":
+                resource_org_ids = [org.id for org in self.organizations]
+                if any(org_id in user_org_ids for org_id in resource_org_ids):
+                    return True
+
+            return False
+
+        return False
+
+    def update(
+        self,
+        db: Session,
+        user,
+        values: dict,
+        commit: Optional[bool] = True,
+        bypass_permission: Optional[bool] = False,
+        *args,
+        **kwargs,
+    ) -> "[ORMBaseMixin]":
+        # check if system record
+        if self.system:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="System records cannot be modified.",
+            )
+
+        # Mirror create(): with bypass_permission the caller is trusted system
+        # code and may pass user=None, so skip the permission machinery
+        # entirely (it dereferences the user).
+        if not bypass_permission:
+            [allowed, scope] = self._check_has_permission(PermissionAction.write, user)
+            if not allowed:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"You do not have permission to update this resource type: {self.__tablename__}",
+                )
+            can_update = self._can_process_with_scope(scope=scope, user=user)
+            if not can_update:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"You do not have permission to update this resource type: {self.__tablename__}",
+                )
+            # delegate model-specific write permission check to hook
+            self._check_model_write_permission(self, user)
+
+        try:
+            relationships = get_relationships(self.get_class())
+            relationship_classes = _get_relationships_class_map(self.get_class())
+            m2m_by_name = {r.name: r for r in relationships.many2many}
+
+            many2many_records_to_update: list[RelationshipRecordCollection] = []
+            one2many_records_to_update: list[RelationshipRecordCollection] = []
+
+            # pop many2many relationship lists from values
+            for relationship in relationships.many2many:
+                if relationship.name in values:
+                    linked_records = values.pop(relationship.name, None)
+                    if linked_records is None:
+                        continue
+                    if linked_records == []:
+                        # if just empty list, simply remove all many2many records in this relationship
+                        if not bypass_permission:
+                            _check_m2m_permission(
+                                user,
+                                relationship,
+                                [],
+                                PermissionAction.delete,
+                                parent_instance=self,
+                            )
+                        setattr(self, relationship.name, [])
+                    else:
+                        # if not empty list, update the many2many records
+                        many2many_records_to_update.append(
+                            RelationshipRecordCollection(
+                                relationship_name=relationship.name,
+                                linked_records=linked_records,
+                                linked_model_class=relationship_classes[
+                                    relationship.name
+                                ],
+                            )
+                        )
+
+            # pop one2many relationship lists from values
+            for relationship in relationships.one2many:
+                if relationship.name in values:
+                    values_to_update = values.pop(relationship.name)
+                    if values_to_update is not None:
+                        one2many_records_to_update.append(
+                            RelationshipRecordCollection(
+                                relationship_name=relationship.name,
+                                linked_records=values_to_update,
+                                linked_model_class=relationship_classes[
+                                    relationship.name
+                                ],
+                            )
+                        )
+
+            # update all values
+            for field, value in values.items():
+                if hasattr(self, field):
+                    setattr(self, field, value)
+
+            # now update many2many records
+            for collection in many2many_records_to_update:
+                if not bypass_permission:
+                    _check_m2m_permission(
+                        user,
+                        m2m_by_name[collection.relationship_name],
+                        collection.linked_records,
+                        PermissionAction.write,
+                        parent_instance=self,
+                    )
+                LinkedModel = collection.linked_model_class
+                ids = [record["id"] for record in collection.linked_records]
+                record_instances = (
+                    db.query(LinkedModel).filter(LinkedModel.id.in_(ids)).all()
+                )
+                setattr(self, collection.relationship_name, record_instances)
+
+            # now update one2many records
+            for collection in one2many_records_to_update:
+                LinkedModel = collection.linked_model_class
+                parent_key_field: FieldInfo = get_one2many_parent_id(
+                    LinkedModel, self.__tablename__
+                )
+
+                if parent_key_field:
+                    existing_records = getattr(self, collection.relationship_name)
+
+                    for record_values in collection.linked_records:
+                        # add new records
+                        if not record_values.get("id"):
+                            record_values[parent_key_field.name] = self.id
+                            record_instance = LinkedModel.create(
+                                db,
+                                user,
+                                record_values,
+                                bypass_permission=bypass_permission,
+                            )
+                            db.add(record_instance)
+                        # update existing records
+                        else:
+                            record_id = record_values.get("id")
+                            record_instance = db.query(LinkedModel).get(record_id)
+                            if record_instance is None:
+                                logger.warning(
+                                    f"Record with ID {record_id} not found in {LinkedModel.__name__}, treating as new record"
+                                )
+                                record_values.pop("id", None)
+                                if parent_key_field:
+                                    record_values[parent_key_field.name] = self.id
+                                record_instance = LinkedModel.create(
+                                    db,
+                                    user,
+                                    record_values,
+                                    bypass_permission=bypass_permission,
+                                )
+                                db.add(record_instance)
+                            else:
+                                record_instance.update(
+                                    db,
+                                    user,
+                                    record_values,
+                                    commit=False,
+                                    bypass_permission=bypass_permission,
+                                )
+
+                    # delete or unlink records that are not in the new list
+                    for existing_record in existing_records:
+                        new_list_record_ids = [
+                            record["id"]
+                            for record in list(
+                                filter(lambda x: x.get("id"), collection.linked_records)
+                            )
+                        ]
+                        if existing_record.id not in new_list_record_ids:
+                            parent_key_column: Column = getattr(
+                                LinkedModel, parent_key_field.name
+                            )
+                            if parent_key_column.nullable:
+                                existing_record.update(
+                                    db,
+                                    user,
+                                    {parent_key_field.name: None},
+                                    commit=False,
+                                    bypass_permission=bypass_permission,
+                                )
+                            else:
+                                existing_record.delete(
+                                    db,
+                                    user,
+                                    commit=False,
+                                    force=True,
+                                    bypass_permission=bypass_permission,
+                                )
+
+            if commit:
+                db.commit()
+                db.refresh(self)
+
+            return self
+        # catch unique constraint violation
+        except IntegrityError as e:
+            if commit:
+                db.rollback()
+            detail = _integrity_error_detail(e)
+            logger.error(f"IntegrityError updating record: {traceback.format_exc()}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Error updating record: {detail}",
+            )
+        except Exception:
+            if commit:
+                db.rollback()
+            logger.error(f"Error updating record: {traceback.format_exc()}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="An error occurred!",
+            )
+
+    def delete(
+        self,
+        db: Session,
+        user,
+        force: Optional[bool] = False,
+        commit: Optional[bool] = True,
+        bypass_permission: Optional[bool] = False,
+        *args,
+        **kwargs,
+    ) -> [DeleteResponse]:
+        # check if system record
+        if self.system:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="System records cannot be modified.",
+            )
+
+        # Mirror create(): with bypass_permission the caller is trusted system
+        # code and may pass user=None, so skip the permission machinery
+        # entirely (it dereferences the user).
+        if not bypass_permission:
+            [allowed, scope] = self._check_has_permission(PermissionAction.delete, user)
+            if not allowed:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="You do not have permission to delete this resource type",
+                )
+            # delegate model-specific write permission check to hook
+            self._check_model_write_permission(self, user)
+
+            if not self._can_process_with_scope(scope, user):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="You do not have permission to delete this resource",
+                )
+
+        affected_records: AffectedRecordResult = get_delete_cascade_records_recursively(
+            db, [self]
+        )
+        if (
+            affected_records.to_delete.keys() or affected_records.to_set_null.keys()
+        ) and not force:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This record has dependencies.",
+            )
+
+        try:
+            # Delete affected records
+            self._delete_affected_records(db, affected_records)
+
+            db.delete(self)
+            if commit:
+                db.commit()
+            return {"success": True}
+
+        except IntegrityError as e:
+            if commit:
+                db.rollback()
+            detail = _integrity_error_detail(e)
+            logger.error(
+                f"IntegrityError deleting {self.__tablename__} id={self.id}: {detail}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Error deleting record: {detail}",
+            )
+        except Exception:
+            if commit:
+                db.rollback()
+            logger.error(f"Error deleting record: {traceback.format_exc()}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="An error occurred!",
+            )
+
+    @classmethod
+    def get_one(
+        cls,
+        db: Session,
+        user,
+        item_id: int,
+        bypass_permission: Optional[bool] = False,
+        *args,
+        **kwargs,
+    ) -> "[ORMBaseMixin]":
+        [allowed, scope] = cls._check_has_permission(PermissionAction.read, user)
+        if not bypass_permission and not allowed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to read this resource type",
+            )
+
+        query = db.query(cls).filter(cls.id == item_id)
+        query = cls._build_query_based_on_scope(query, user, scope, cls)
+
+        instance = query.first()
+        if instance is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to read this resource",
+            )
+        return instance
+
+    @classmethod
+    def get_all(
+        cls, db: Session, user, pagination: PAGINATION, *args, **kwargs
+    ) -> list["[ORMBaseMixin]"]:
+        [allowed, scope] = cls._check_has_permission(PermissionAction.read, user)
+        if not allowed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to read this resource type",
+            )
+
+        skip, limit = pagination.get("skip"), pagination.get("limit")
+        query = db.query(cls)
+        query = cls._build_query_based_on_scope(query, user, scope, cls)
+        query = query.filter_by(active=True)
+
+        return query.offset(skip).limit(limit).all()
+
+    @classmethod
+    def search(
+        cls,
+        db: Session,
+        user,
+        pagination: PAGINATION,
+        search: Optional[SearchQuery] = None,
+        order_by: Optional[OrderByCriteria] = None,
+        bypass_permission: Optional[bool] = False,
+        *args,
+        **kwargs,
+    ):
+        model = models_pool[cls.__tablename__]
+        [allowed, scope] = model._check_has_permission(PermissionAction.read, user)
+        if not bypass_permission and not allowed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to read this resource type",
+            )
+
+        skip, limit = pagination.get("skip"), pagination.get("limit")
+        query = db.query(model)
+
+        if search:
+            query = cls._apply_search_conditions(query, search, model)
+
+        if order_by and order_by.field:
+            query = cls.__apply_order_by(model, query, order_by, db, user)
+
+        # build query based on permission scope, paginate, and return
+        query = cls._build_query_based_on_scope(query, user, scope, model)
+
+        return {"total": query.count(), "data": query.offset(skip).limit(limit).all()}
+
+    @classmethod
+    def bulk_delete(
+        cls,
+        db: Session,
+        user,
+        search: SearchQuery,
+        force: Optional[bool] = False,
+        bypass_permission: Optional[bool] = False,
+        *args,
+        **kwargs,
+    ) -> BulkDeleteResponse:
+        """
+        Bulk delete with search query
+
+        @param db: The database session.
+        @param user: The user performing the action.
+        @param search: The search query.
+        @param force: Allow to delete referenced records
+        @param bypass_permission: Bypass permission
+        @param args:
+        @param kwargs:
+        @return: BulkDeleteResponse
+        """
+        [allowed, scope] = cls._check_has_permission(PermissionAction.delete, user)
+        if not bypass_permission and not allowed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to delete this resource type",
+            )
+        # delegate model-specific write permission check to hook
+        cls._check_model_write_permission(None, user)
+
+        # Start a transaction
+        try:
+            # Get model
+            model = models_pool[cls.__tablename__]
+
+            # Get query
+            query = db.query(cls)
+
+            # apply search conditions to find deleting record
+            query = cls._apply_search_conditions(query, search, model)
+
+            # Build query based on permission scope, paginate, and return
+            query = cls._build_query_based_on_scope(query, user, scope, model)
+
+            # Apply subclass-specific eager-load options (e.g. joinedload for cleanup hooks)
+            query = query.options(*cls._get_bulk_delete_query_options())
+
+            # Get the records to be deleted
+            records_to_delete = query.all()
+
+            # Delete referenced/effected records if force param is True
+            if force:
+                # Get affected records
+                affected_records: AffectedRecordResult = (
+                    get_delete_cascade_records_recursively(
+                        db, records=records_to_delete
+                    )
+                )
+
+                # Delete affected records
+                cls._delete_affected_records(db, affected_records)
+
+            # Delete main records
+            for record in records_to_delete:
+                db.delete(record)
+            db.commit()
+
+            # Return the result
+            return BulkDeleteResponse(
+                success=True,
+                deleted_count=len(records_to_delete),
+                deleted_records=records_to_delete,
+            )
+
+        except IntegrityError as e:
+            db.rollback()
+            detail = _integrity_error_detail(e)
+            logger.error(
+                f"Error bulk deleting: {detail}\nFull traceback: {traceback.format_exc()}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Cannot delete records because they are referenced by other records (or due to other integrity "
+                "errors).",
+            )
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Error bulk deleting record: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"An error occurred while deleting records: {str(e)}",
+            )
+
+    @classmethod
+    def _get_bulk_delete_query_options(cls):
+        """Hook: return SQLAlchemy query options applied during bulk_delete before records are loaded.
+        Override in subclasses to eagerly load relationships needed for post-delete cleanup.
+        """
+        return []
+
+    @classmethod
+    def _sort_tables_for_delete(cls, table_names) -> list[str]:
+        """Order table names so a referencing table is deleted before the table
+        it references. Unknown tables keep their original position.
+        """
+        from sqlalchemy.schema import sort_tables
+
+        table_names = list(table_names)
+        tables = []
+        for name in table_names:
+            model = models_pool.get(name)
+            table = getattr(model, "__table__", None)
+            if table is not None:
+                tables.append(table)
+
+        try:
+            # sort_tables puts a referenced table before the tables that
+            # reference it — the create order, i.e. the reverse of ours.
+            ordered = [table.name for table in reversed(sort_tables(tables))]
+        except Exception:
+            logger.warning(
+                "Could not sort affected tables by dependency; "
+                "falling back to collection order.",
+                exc_info=True,
+            )
+            return table_names
+
+        ordered = [name for name in ordered if name in table_names]
+        ordered += [name for name in table_names if name not in ordered]
+        return ordered
+
+    @classmethod
+    def _delete_affected_records(
+        cls, db: Session, affected_records: AffectedRecordResult
+    ):
+        """
+        Delete referenced/affected records.
+
+        @param db: The database session.
+        @param affected_records: The affected records these will be deleted.
+        @return: None
+        """
+
+        # NB-C7: the set-null pass has to run BEFORE the deletes. A row whose
+        # nullable FK still points at a record in `to_delete` blocks that
+        # record's DELETE ("Key (id)=(N) is still referenced from table ..."),
+        # which surfaced as a 409 from `bulk_delete?force=true`.
+        #
+        # A record can also land in BOTH buckets — reached once through a NOT
+        # NULL FK (delete) and once through a nullable one (set null); hvap-app's
+        # membership is customer_id NOT NULL + equipment_id nullable. Those are
+        # being deleted anyway, so skip them here: writing to an instance that
+        # is about to be deleted only produces a pointless UPDATE.
+        records_to_delete = {
+            (table, item.record.id)
+            for table, items in affected_records.to_delete.items()
+            for item in items
+        }
+
+        # Set affected records to null
+        for table, items in affected_records.to_set_null.items():
+            for item in items:
+                if (table, item.record.id) in records_to_delete:
+                    continue
+                setattr(item.record, item.affected_field, None)
+        db.flush()
+
+        # Delete affected records, most-dependent table first. SQLAlchemy only
+        # orders a flush's DELETEs by *mapper* dependency, so two tables linked
+        # by a bare ForeignKey column with no `relationship()` between them can
+        # be flushed in declaration order and Postgres refuses the parent
+        # (NB-C7). Flush per table so the order actually reaches the database.
+        for table in cls._sort_tables_for_delete(affected_records.to_delete.keys()):
+            for item in affected_records.to_delete[table]:
+                db.delete(item.record)
+            db.flush()
+
+        # Delete rows in junction (M2M) tables that the ORM cascade can't see
+        # because the join table has no `id` column / no registered model.
+        if affected_records.junction_deletes:
+            metadata = MetaData()
+            for jd in affected_records.junction_deletes:
+                if not jd.ids:
+                    continue
+                table = Table(jd.table_name, metadata, autoload_with=db.bind)
+                db.execute(table.delete().where(table.c[jd.column].in_(jd.ids)))
+            db.flush()
+
+    @classmethod
+    def _filter_permission(cls, permission: str) -> bool:
+        table = permission.split(":")[0]
+        return table == cls.__tablename__
+
+    @classmethod
+    def _filter_action(cls, permission: str, action: PermissionAction) -> bool:
+        allowed_action = permission.split(":")[1]
+        return allowed_action == action or allowed_action == PermissionAction.all
+
+    @classmethod
+    def _check_has_permission(
+        cls,
+        action: PermissionAction,
+        user,
+    ) -> [bool, PermissionScope]:
+        """
+        Check if the user has the required permissions for the given action.
+
+        Args:
+            action (str): The action to check permissions for (e.g., 'read', 'write', '').
+            user: The user to check permissions for.
+
+        Returns:
+            [bool, str]: A tuple containing a boolean indicating permission status and
+            a string with the highest scope (e.g., 'own', 'org', '*').
+        """
+        all_permissions = user.get_user_permissions()
+
+        # filter permissions by this table name or '*'
+        table_permissions = list(filter(cls._filter_permission, all_permissions))
+        if len(table_permissions) == 0:
+            return False, PermissionScope.none
+
+        # check if can do this action on table
+        action_permissions = list(
+            filter(lambda p: cls._filter_action(p, action), table_permissions)
+        )
+        if len(action_permissions) == 0:
+            return False, PermissionScope.none
+
+        # gather all scopes
+        scopes = list(map(lambda x: x.split(":")[2], action_permissions))
+
+        # get the highest scope, * > org > own
+        if PermissionScope.all in scopes:
+            return True, PermissionScope.all
+        if PermissionScope.org in scopes:
+            return True, PermissionScope.org
+        if PermissionScope.own in scopes:
+            return True, PermissionScope.own
+        return False, PermissionScope.none
+
+    @classmethod
+    def check_organization_scope_permission(
+        cls, action: PermissionAction, user, organization_id: int
+    ) -> tuple[bool, str]:
+        """
+        Check whether `user` may perform `action` against an explicit
+        `organization_id` supplied by the caller (e.g. a request body field),
+        for actions that aren't scoped to one specific row — a render/export/
+        report endpoint that reads across an entire org using
+        organization_id as a plain argument, rather than filtering rows
+        already loaded from the DB.
+
+        `_check_has_permission` alone isn't enough there: it only proves the
+        user has *some* level of access to this table, not that this
+        organization_id is one they're allowed to target.
+        `_build_query_based_on_scope` doesn't apply either — it filters an
+        existing row-set, and there's no row to filter here.
+
+        Scope handling:
+        - `*`: unrestricted.
+        - `org`: allowed only if `organization_id` is in `user.get_org_ids()`.
+        - `own` and `none`: never allowed. `own` fails closed even when
+          `organization_id` is the user's own org, mirroring
+          `_build_query_based_on_scope`'s documented fail-closed convention —
+          an operation not scoped to a specific row can't distinguish "the
+          user's own" from the rest of the org, so `own` must not be treated
+          as equivalent to `org` here.
+
+        Returns (True, "") if allowed, otherwise (False, <reason>). Turning
+        the reason into an HTTPException (or any other response) is left to
+        the caller.
+        """
+        allowed, scope = cls._check_has_permission(action, user)
+        if not allowed:
+            return (
+                False,
+                f"You do not have permission to {action.value} {cls.__tablename__}",
+            )
+
+        if scope == PermissionScope.all:
+            return True, ""
+
+        if scope == PermissionScope.org and organization_id in user.get_org_ids():
+            return True, ""
+
+        return (
+            False,
+            f"You do not have permission to {action.value} {cls.__tablename__} "
+            "for this organization",
+        )
+
+    @classmethod
+    def _csv_column_attr_map(cls) -> dict[str, str]:
+        model = models_pool.get(cls.__tablename__, cls)
+        mapper = inspect(model)
+        col_to_attr = {}
+        for prop in mapper.column_attrs:
+            for col in prop.columns:
+                col_to_attr[col.name] = prop.key
+        return col_to_attr
+
+    @staticmethod
+    def _csv_format_value(val: Any) -> str:
+        if val is None:
+            return ""
+        if isinstance(val, bool):
+            return "true" if val else "false"
+        if isinstance(val, enum.Enum):
+            return str(val.value)
+        if isinstance(val, datetime):
+            return val.isoformat()
+        if hasattr(val, "isoformat"):
+            return val.isoformat()
+        if isinstance(val, (dict, list)):
+            return json.dumps(val)
+        if isinstance(val, Decimal):
+            return str(val)
+        return str(val)
+
+    @classmethod
+    def export(
+        cls,
+        db: Session,
+        user,
+        pagination: PAGINATION,
+        search: Optional[SearchQuery] = None,
+        order_by: Optional[OrderByCriteria] = None,
+        *args,
+        **kwargs,
+    ):
+        search_result = cls.search(
+            db=db,
+            user=user,
+            pagination=pagination,
+            search=search,
+            order_by=order_by,
+            *args,
+            **kwargs,
+        )
+        records = search_result["data"]
+        columns = cls.csv_export_columns()
+        attr_map = cls._csv_column_attr_map()
+
+        csv_string = StringIO()
+        writer = csv.DictWriter(csv_string, fieldnames=columns, delimiter=",")
+        writer.writeheader()
+        for record in records:
+            row = {}
+            for col in columns:
+                attr = attr_map.get(col, col)
+                val = getattr(record, attr, None)
+                row[col] = cls._csv_format_value(val)
+            writer.writerow(row)
+
+        return csv_string
+
+    @classmethod
+    def import_records(
+        cls,
+        db: Session,
+        user,
+        csvfile,
+        current_organization_id: Optional[int] = None,
+        dry_run: bool = False,
+        background_tasks=None,
+        *args,
+        **kwargs,
+    ):
+        model = models_pool.get(cls.__tablename__, cls)
+        has_org = hasattr(model, "organization_id")
+        org_id = current_organization_id or getattr(
+            user, "current_organization_id", None
+        )
+        if has_org and org_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="X-Organization-Id header required for CSV import",
+            )
+
+        try:
+            contents = csvfile.file.read()
+        finally:
+            csvfile.file.close()
+
+        try:
+            decoded = contents.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="File is not valid UTF-8. Save as 'CSV UTF-8' from Excel.",
+            )
+
+        if not decoded.strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="The file is empty.",
+            )
+
+        header_line = decoded.split("\n", 1)[0]
+        delimiter = ";" if header_line.count(";") > header_line.count(",") else ","
+
+        buf = StringIO(decoded)
+        reader = csv.DictReader(buf, delimiter=delimiter)
+
+        accepted = {c.lower().strip(): c for c in model.csv_import_columns()}
+        export_cols = {c.lower().strip() for c in model.csv_export_columns()}
+        header_map = {}
+        ignored_columns = []
+        if reader.fieldnames:
+            for raw in reader.fieldnames:
+                key = raw.strip().lower()
+                if key in accepted:
+                    header_map[raw] = accepted[key]
+                elif key and key != "id" and key not in export_cols:
+                    ignored_columns.append(raw.strip())
+            if "id" in {f.strip().lower() for f in reader.fieldnames}:
+                id_raw = next(f for f in reader.fieldnames if f.strip().lower() == "id")
+                header_map[id_raw] = "id"
+            for raw in reader.fieldnames:
+                key = raw.strip().lower()
+                if key in {
+                    c.lower() for c in model.csv_import_readonly_columns
+                } and key not in {"id"}:
+                    if key not in {c.lower() for c in ignored_columns}:
+                        ignored_columns.append(raw.strip())
+
+        if not header_map:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No recognized columns in the CSV header.",
+            )
+
+        report = {
+            "created": 0,
+            "updated": 0,
+            "skipped": 0,
+            "error_count": 0,
+        }
+        errors: list[CsvImportRowError] = []
+
+        def add_error(line_num: int, message: str):
+            report["error_count"] += 1
+            if len(errors) < model.csv_import_max_errors:
+                errors.append(CsvImportRowError(row=line_num, message=message))
+
+        if not db.in_transaction():
+            db.begin()
+        root_tx = db.get_transaction()
+
+        for raw_row in reader:
+            line = reader.line_num
+            row = {}
+            for k, v in raw_row.items():
+                if k in header_map:
+                    row[header_map[k]] = v
+
+            if all(v is None or not str(v).strip() for v in row.values()):
+                report["skipped"] += 1
+                continue
+
+            try:
+                with db.begin_nested():
+                    values = model._convert_csv_row(row)
+                    instance = model.csv_import_match(db, user, values, org_id)
+                    values.pop("id", None)
+                    if instance is not None:
+                        instance.update(
+                            db,
+                            user,
+                            values,
+                            commit=False,
+                            dry_run=dry_run,
+                            background_tasks=background_tasks,
+                        )
+                        action = "updated"
+                    else:
+                        model.create(
+                            db,
+                            user,
+                            values,
+                            commit=False,
+                            dry_run=dry_run,
+                            background_tasks=background_tasks,
+                        )
+                        action = "created"
+                    db.flush()
+                report[action] += 1
+            except HTTPException as e:
+                add_error(line, str(e.detail))
+            except IntegrityError as e:
+                add_error(line, _integrity_error_detail(e))
+            except (ValueError, TypeError) as e:
+                add_error(line, f"Invalid value: {e}")
+            except Exception:
+                logger.error(traceback.format_exc())
+                add_error(line, "Unexpected error")
+
+            if db.get_transaction() is not root_tx:
+                db.rollback()
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Import aborted: the model rolled back the transaction; no rows were imported",
+                )
+
+        if dry_run:
+            db.rollback()
+        else:
+            db.commit()
+
+        buf.close()
+        total = (
+            report["created"]
+            + report["updated"]
+            + report["skipped"]
+            + report["error_count"]
+        )
+        return CsvImportResponse(
+            success=report["error_count"] == 0,
+            dry_run=dry_run,
+            total=total,
+            created=report["created"],
+            updated=report["updated"],
+            skipped=report["skipped"],
+            error_count=report["error_count"],
+            errors=errors,
+            ignored_columns=sorted(set(ignored_columns)),
+        )
+
+    def serialize(self) -> dict:
+        result = self.__dict__.copy()
+        # Convert Enum values to their actual string values
+        # instead of the Enum object key
+        for key, value in self.__dict__.items():
+            if isinstance(value, enum.Enum):
+                result[key] = value.value
+        # Remove the SQLAlchemy internal state from the records
+        result.pop("_sa_instance_state", None)
+        return result
+
+    @classmethod
+    def _convert_csv_field_value(cls, value: Any, column: Column) -> Any:
+        if value == "":
+            return None
+        col_type = column.type
+        if isinstance(col_type, Boolean):
+            low = str(value).strip().lower()
+            if low in {"true", "1", "t", "y", "yes"}:
+                return True
+            if low in {"false", "0", "f", "n", "no"}:
+                return False
+            raise ValueError(
+                f"'{value}' is not a valid boolean for column '{column.name}'"
+            )
+        if isinstance(col_type, Enum):
+            py_type = col_type.python_type
+            try:
+                return py_type(value)
+            except (ValueError, KeyError):
+                try:
+                    return py_type[value]
+                except KeyError:
+                    raise ValueError(
+                        f"'{value}' is not a valid value for {column.name}"
+                    )
+        if isinstance(col_type, Integer) and not isinstance(col_type, Boolean):
+            return int(value)
+        if isinstance(col_type, Float):
+            return float(value)
+        if isinstance(col_type, Numeric):
+            try:
+                return Decimal(str(value))
+            except InvalidOperation:
+                raise ValueError(f"'{value}' is not a valid number for {column.name}")
+        if isinstance(col_type, DateTime):
+            return datetime.fromisoformat(value)
+        if isinstance(col_type, Date):
+            return (
+                datetime.fromisoformat(value).date()
+                if "T" in value
+                else datetime.strptime(value, "%Y-%m-%d").date()
+            )
+        if isinstance(col_type, JSON):
+            return json.loads(value)
+        if isinstance(col_type, UUID):
+            return PyUUID(value)
+        if isinstance(col_type, ARRAY) and isinstance(value, str):
+            return cls._convert_csv_array_value(value, column)
+        return value
+
+    @classmethod
+    def _convert_csv_array_value(cls, value: str, column: Column) -> Any:
+        """Parse a CSV cell into a list for an ARRAY column.
+
+        Without this, the raw string is bound directly and SQLAlchemy iterates
+        it character by character — the row silently ends up as a list of single
+        characters. Accepts a JSON array (`["a", "b"]`) or a Postgres array
+        literal (`{"a", "b"}`); anything else is treated as a single element.
+        """
+        text = value.strip()
+
+        items: Optional[list] = None
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, list):
+                items = parsed
+        elif text.startswith("{") and text.endswith("}"):
+            items = cls._parse_postgres_array_literal(text[1:-1])
+
+        if items is None:
+            items = [text]
+
+        item_type = getattr(column.type, "item_type", None)
+        if item_type is not None:
+            item_column = Column(column.name, item_type)
+            items = [
+                (
+                    cls._convert_csv_field_value(item, item_column)
+                    if isinstance(item, str)
+                    else item
+                )
+                for item in items
+            ]
+
+        return items
+
+    @classmethod
+    def _parse_postgres_array_literal(cls, inner: str) -> list:
+        """Split the body of a Postgres array literal into its elements.
+
+        `inner` is the text between the braces. Postgres escapes an embedded
+        quote with a backslash inside the quoted element (it emits
+        `{"say \\"hi\\""}`), not by doubling it, so a CSV reader's dialect
+        misreads it and the quoting is handled here directly. An unquoted,
+        unescaped NULL is SQL NULL; a quoted "NULL" is the literal string.
+        Unquoted elements are whitespace-trimmed, quoted ones are not.
+        """
+        if not inner.strip():
+            return []
+
+        items: list = []
+        current: list[str] = []
+        # `protected` = this element used quoting or escaping, so it is a string
+        # even if it spells NULL, and its whitespace is significant.
+        protected = False
+        in_quotes = False
+        escaped = False
+
+        def flush():
+            nonlocal current, protected
+            text = "".join(current)
+            if not protected:
+                text = text.strip()
+                if text.upper() == "NULL":
+                    items.append(None)
+                    current, protected = [], False
+                    return
+            items.append(text)
+            current, protected = [], False
+
+        for char in inner:
+            if escaped:
+                current.append(char)
+                escaped = False
+            elif char == "\\":
+                escaped = True
+                protected = True
+            elif char == '"':
+                in_quotes = not in_quotes
+                protected = True
+            elif char == "," and not in_quotes:
+                flush()
+            else:
+                current.append(char)
+
+        flush()
+        return items
+
+    @classmethod
+    def _convert_csv_row(cls, row: dict) -> dict:
+        result = {}
+        model = models_pool[cls.__tablename__]
+        for column in model.__table__.columns:
+            field_name = column.name
+            if field_name in row and row[field_name] is not None:
+                result[field_name] = model._convert_csv_field_value(
+                    row[field_name], column
+                )
+        return result
+
+    @classmethod
+    def get_class(cls):
+        return cls
+
+    @classmethod
+    def _apply_search_conditions(cls, query: Query, search: SearchQuery, model):
+        """
+        Apply search conditions to the query.
+        Modify query object with the search conditions.
+
+        @param query: The query object.
+        @param search: The search query.
+        @return The modified query object.
+        """
+        search_dict = search.model_dump()
+        all_conditions = [c for conds in search_dict.values() for c in conds]
+        has_active_condition = any(c["field"] == "active" for c in all_conditions)
+
+        for logical_operator, conditions in search_dict.items():
+            criteria_filters = []
+
+            for condition in conditions:
+                field, operator, value = (
+                    condition["field"],
+                    condition["operator"],
+                    condition["value"],
+                )
+
+                ReferencedModel = model
+                # check for case field is attr1.attr2
+                is_relationship = "." in field
+
+                if is_relationship:
+                    fields = field.split(".")
+                    if not hasattr(model, fields[0]):
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f'Relation "{fields[0]}" does not exist on this resource type',
+                        )
+                    relation = getattr(model, fields[0])
+
+                    # re-assign the ReferencedModel
+                    ReferencedModel = models_pool[relation.property.target.name]
+                    field = fields[1]
+                    if not hasattr(ReferencedModel, fields[1]):
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f'Field "{field}" does not exist on this resource type 1 ',
+                        )
+
+                elif not hasattr(ReferencedModel, field):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f'Field "{field}" does not exist on this resource type 2',
+                    )
+
+                def _is_datetime_col(col):
+                    try:
+                        return col.type.python_type == datetime
+                    except NotImplementedError:
+                        return False
+
+                datetime_fields = list(
+                    filter(
+                        _is_datetime_col,
+                        model.__table__.columns,
+                    )
+                )
+                is_datetime = field in [col.name for col in datetime_fields]
+
+                if is_datetime and value is not None:
+                    value = parse_date(value)
+
+                # check if field is enum, if yes the value should be the enum value
+                if field in ReferencedModel.__table__.columns:
+                    column_type = ReferencedModel.__table__.columns[field].type
+                    if column_type.__class__.__name__ == "Enum":
+                        # RB-19: an unknown member raises ValueError here. Without
+                        # the guard it escapes the query builder as a 500; the
+                        # caller sent an unprocessable value, so answer 422 and
+                        # name the members that would have worked.
+                        try:
+                            # check if list of enum values
+                            if isinstance(value, list):
+                                value = [column_type.python_type(v) for v in value]
+                            else:
+                                value = column_type.python_type(value)
+                        except ValueError:
+                            allowed = ", ".join(
+                                str(getattr(member, "value", member))
+                                for member in column_type.python_type
+                            )
+                            raise HTTPException(
+                                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                detail=(
+                                    f'Invalid value for enum field "{field}": '
+                                    f"{value!r}. Allowed values: {allowed}"
+                                ),
+                            ) from None
+                else:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f'Field "{field}" does not exist on this resource type',
+                    )
+
+                condition_expr = None
+                match operator:
+                    case "=":
+                        condition_expr = getattr(ReferencedModel, field) == value
+                    case "!=":
+                        condition_expr = getattr(ReferencedModel, field) != value
+                    case "in":
+                        if isinstance(value, list):
+                            condition_expr = getattr(ReferencedModel, field).in_(value)
+                    case "not_in":
+                        if isinstance(value, list):
+                            condition_expr = getattr(ReferencedModel, field).not_in(
+                                value
+                            )
+                    case "between":
+                        if isinstance(value, list) and len(value) == 2:
+                            condition_expr = getattr(ReferencedModel, field).between(
+                                value[0], value[1]
+                            )
+                    case "contains":
+                        condition_expr = getattr(ReferencedModel, field).contains(value)
+                    case ">":
+                        condition_expr = getattr(ReferencedModel, field) > value
+                    case ">=":
+                        condition_expr = getattr(ReferencedModel, field) >= value
+                    case "<":
+                        condition_expr = getattr(ReferencedModel, field) < value
+                    case "<=":
+                        condition_expr = getattr(ReferencedModel, field) <= value
+                    case "like":
+                        condition_expr = getattr(ReferencedModel, field).like(
+                            f"%{value}%"
+                        )
+                    case "ilike":
+                        condition_expr = getattr(ReferencedModel, field).ilike(
+                            f"%{value}%"
+                        )
+                    case _:
+                        # Handle unsupported operators or other cases here
+                        pass
+
+                if condition_expr is not None:
+                    criteria_filters.append(condition_expr)
+                    if is_relationship:
+                        query = query.join(relation)
+
+            if criteria_filters:
+                if logical_operator.lower() == "or":
+                    query = query.filter(or_(*criteria_filters))
+                elif logical_operator.lower() == "and":
+                    query = query.filter(and_(*criteria_filters))
+
+        if not has_active_condition:
+            query = query.filter_by(active=True)
+
+        return query
+
+    @classmethod
+    def _build_query_based_on_scope(
+        cls, query: Query, user, scope: PermissionScope, model
+    ) -> Query:
+        """
+        Restrict `query` to records the user can access under `scope`.
+
+        Fails closed: when scope is `own` or `org` but no recognized
+        ownership / org-membership column exists on the model — or the user
+        has no org memberships under `org` scope — the returned query
+        matches nothing.
+
+        Scope `all` and `none` return the query unchanged. `none` is only
+        reached via `bypass_permission` callers that have already opted out
+        of scope enforcement; without bypass, `_check_has_permission`
+        denies before this helper runs.
+        """
+        if scope == PermissionScope.all or scope == PermissionScope.none:
+            # `all` allows everything; `none` is only reachable via
+            # bypass_permission callers that have already opted out of
+            # scope enforcement.
+            return query
+
+        if scope == PermissionScope.own:
+            if hasattr(model, "owner_id"):
+                return query.filter_by(owner_id=user.id)
+            if model.__tablename__ == "user":
+                return query.filter_by(id=user.id)
+            if model.__tablename__ == "organization":
+                return query.filter(model.id.in_(user.get_org_ids()))
+            return query.filter(false())
+
+        if scope == PermissionScope.org:
+            membership_org_ids = user.get_org_ids()
+            if not membership_org_ids:
+                return query.filter(false())
+
+            # SB-21: narrow to the request's org, not the whole membership set.
+            # `current_organization_id` is the validated X-Organization-Id
+            # (`deepsel.auth.current_org.resolve_current_organization_id` 403s
+            # when the user is not a member), so a two-org user asking for org A
+            # must not read org B's rows. With no header it stays membership-wide.
+            current_org_id = getattr(user, "current_organization_id", None)
+            user_org_ids = (
+                [current_org_id] if current_org_id is not None else membership_org_ids
+            )
+
+            if model.__tablename__ == "user":
+                OrganizationModel = models_pool["organization"]
+                return query.filter(
+                    model.organizations.any(OrganizationModel.id.in_(user_org_ids))
+                )
+            if model.__tablename__ == "organization":
+                # The org switcher has to keep listing every org the user
+                # belongs to, so this one stays membership-wide on purpose.
+                return query.filter(model.id.in_(membership_org_ids))
+            if hasattr(model, "organization_id"):
+                return query.filter(model.organization_id.in_(user_org_ids))
+            return query.filter(false())
+
+        return query.filter(false())
+
+    @classmethod
+    def _is_seed_row_allowed_for_org(
+        cls, row: dict, organization_id: Optional[int]
+    ) -> bool:
+        """Hook: return False to skip one seed CSV row for one organization.
+
+        Default is to install every row into every organization the loader
+        visits. Override on a model that owns rows which must not be replicated
+        into tenant organizations (see `RoleModel`, which keeps the `*`-scoped
+        `admin_role` in the platform org only).
+        """
+        return True
+
+    @classmethod
+    def install_csv_data(
+        cls,
+        file_name: str,
+        db: Session,
+        demo_data: bool = False,
+        organization_id: Optional[int] = None,
+        base_dir: str = None,
+        force_update: bool = False,
+        auto_commit: bool = True,
+    ):
+        """
+        Import developer-defined CSV files, called during install_apps()
+
+        @param file_name: The name of the file to import
+        @param db: The database session
+        @param demo_data: Whether the data is demo data. Demo data will not check for existing records, insert regardless
+        @param organization_id: The organization ID assigned to records when the CSV omits it. Required for tenant-scoped models; callers that want multi-org install should go through install_apps.import_csv_data().
+        @param base_dir: Base directory for resolving relative file paths
+        @param force_update: Whether to force update existing records
+        @param auto_commit: Whether to automatically commit after processing all rows. Set to False to manage transactions externally.
+        @return: None
+        """
+
+        data: list[dict] = cls._prepare_csv_data_install(
+            file_name, organization_id, demo_data
+        )
+
+        # loop through rows
+        for row in data:
+            # Resolve slash-form relational keys first so that
+            # `organization/organization_id` becomes a concrete `organization_id`
+            # value on the row before we run the existence check. Otherwise the
+            # check would fall back to the caller's `organization_id` arg and
+            # miss rows whose CSV pins them to a different org.
+            for key in list(row.keys()):
+                if "/" in key and key.count("/") == 1:
+                    cls._install_related_column(key, row, db, organization_id)
+
+            # check if record exists in db
+            existing_record = None
+            string_id = row.get("string_id", None)
+            if string_id:
+                query = db.query(cls).filter_by(string_id=string_id)
+                if hasattr(cls, "organization_id"):
+                    # Prefer the row's own org_id (set by the CSV or by the
+                    # slash-key resolution above) over the function arg, so the
+                    # lookup matches the row's true destination. CSV values
+                    # arrive as strings; coerce to int before filtering against
+                    # the integer column.
+                    lookup_org_id = row.get("organization_id", organization_id)
+                    if lookup_org_id is not None:
+                        query = query.filter_by(organization_id=int(lookup_org_id))
+
+                existing_record = query.first()
+
+            # process remaining special field name formats (file/attachment/json)
+            for key in list(row.keys()):
+                if ":" in key and key.count(":") == 1:
+                    source_type, field_name = key.split(":")
+                    if source_type == "file":
+                        cls._install_file_column(
+                            key,
+                            row,
+                            base_dir=base_dir,
+                            csv_dir=os.path.dirname(file_name),
+                        )
+
+                    if source_type == "attachment":
+                        cls._install_attachment_column(
+                            key,
+                            row,
+                            db,
+                            organization_id,
+                            csv_dir=os.path.dirname(file_name),
+                        )
+
+                    elif source_type == "json":
+                        cls._install_json_column(key, row, db, organization_id)
+
+            # Drop keys that aren't real columns on this model (e.g. seed CSVs
+            # carrying organization_id for tables that no longer have it).
+            for key in list(row.keys()):
+                if not hasattr(cls, key):
+                    row.pop(key)
+
+            # Per-row org scoping hook. A seed CSV can only pin rows to an org
+            # through an `organization_id` column, and that switch is file-level
+            # (see install_apps.import_csv_data), so a model that must keep some
+            # of its rows out of tenant organizations has nowhere else to say so.
+            row_org_id = row.get("organization_id", organization_id)
+            if not cls._is_seed_row_allowed_for_org(row, row_org_id):
+                continue
+
+            if existing_record:
+                existing_record._install_update_existing_record(row, db, force_update)
+            else:
+                # Natural-key fallback: a row with this PK may already exist
+                # without (or with a different) string_id — created by app code
+                # or by SQLAlchemy M2M `secondary` writes that drop non-FK
+                # columns. Skip the INSERT to avoid a PK UniqueViolation.
+                # Mirrors the no-op behavior of the string_id-match branch for
+                # non-system rows. Only engages when every PK column has a
+                # resolved value in the row, so surrogate-id tables whose CSV
+                # omits `id` fall through to the normal INSERT path.
+                pk_cols = list(inspect(cls).primary_key)
+                pk_kwargs = {}
+                for col in pk_cols:
+                    if col.name in row and row[col.name] is not None:
+                        val = row[col.name]
+                        # CSV values arrive as strings; coerce to the column's
+                        # Python type so `filter_by` matches against integer PKs.
+                        try:
+                            py_type = col.type.python_type
+                            if not isinstance(val, py_type):
+                                val = py_type(val)
+                        except (NotImplementedError, ValueError, TypeError):
+                            pass
+                        pk_kwargs[col.name] = val
+                natural = None
+                if pk_kwargs and len(pk_kwargs) == len(pk_cols):
+                    natural = db.query(cls).filter_by(**pk_kwargs).first()
+                if natural is not None:
+                    if (
+                        force_update
+                        or row.get("system") is True
+                        or getattr(natural, "system", False)
+                    ):
+                        for k, v in row.items():
+                            setattr(natural, k, v)
+                        db.flush()
+                        logger.debug(f"Force-applied to natural-key match {natural}")
+                    else:
+                        logger.debug(
+                            f"Skipped (natural-key match exists) {cls.__name__} {pk_kwargs}"
+                        )
+                else:
+                    new_record = cls(**row)
+                    db.add(new_record)
+                    logger.debug(f"Added {new_record}")
+
+        # Commit once after all rows if auto_commit is True
+        if auto_commit:
+            db.commit()
+
+    @classmethod
+    def _prepare_csv_data_install(
+        cls, file_name: str, organization_id: Optional[int], demo_data: bool
+    ) -> list[dict]:
+        """
+        Prepare data for CSV export.
+
+        @param data: The data to prepare.
+        @return: The prepared data.
+        """
+        # check if string_id column exists, if not throw error
+        # except if we are inserting demo data
+
+        with open(file_name, "r", encoding="utf-8") as csv_file:
+            csv_reader = csv.DictReader(csv_file)
+
+            if not demo_data and "string_id" not in csv_reader.fieldnames:
+                raise Exception(
+                    f'File {file_name} does not have required "string_id" column'
+                )
+
+            [owner_value_overwrite, organization_value_overwrite] = (
+                cls._prepare_default_owner_and_organization_overwrite(
+                    csv_reader, organization_id
+                )
+            )
+
+            # convert to list of dicts
+            data: list[dict] = list(csv_reader)
+
+        # Collect DateTime column names to convert empty strings to None
+        datetime_column_names = {
+            col.name for col in cls.__table__.columns if isinstance(col.type, DateTime)
+        }
+
+        # ARRAY cells must be parsed into a list — a raw string bound to an
+        # ARRAY column is iterated character by character, silently storing a
+        # list of single characters.
+        array_columns = {
+            col.name: col
+            for col in cls.__table__.columns
+            if isinstance(col.type, ARRAY)
+        }
+
+        # convert boolean values from string and ensure proper types
+        for row in data:
+            for key in list(row.keys()):
+                if row[key] == "True" or row[key] == "true":
+                    row[key] = True
+                elif row[key] == "False" or row[key] == "false":
+                    row[key] = False
+                elif row[key] == "None":
+                    row[key] = None
+                elif row[key] == "" and key in datetime_column_names:
+                    row[key] = None
+                elif key in array_columns and isinstance(row[key], str):
+                    column = array_columns[key]
+                    if row[key] == "":
+                        row[key] = None if column.nullable else []
+                    else:
+                        row[key] = cls._convert_csv_array_value(row[key], column)
+
+            # Ensure string_id remains a string (important for numeric string_ids)
+            if "string_id" in row and row["string_id"]:
+                row["string_id"] = str(row["string_id"])
+
+        # if overwrite values are not None, we need to add these columns to the data
+        if owner_value_overwrite or organization_value_overwrite:
+            for row in data:
+                if owner_value_overwrite:
+                    row["user/owner_id"] = owner_value_overwrite
+                if organization_value_overwrite:
+                    row["organization_id"] = int(organization_value_overwrite)
+
+        return data
+
+    @classmethod
+    def _prepare_default_owner_and_organization_overwrite(
+        cls, csv_reader: csv.DictReader, organization_id: Optional[int]
+    ):
+        """
+        Prepare default owner and organization values.
+        """
+
+        # assign default values to owner_id and organization_id
+        owner_value_overwrite = None
+        organization_value_overwrite = None
+
+        # Only overwrite when NEITHER form of the column is present in the
+        # CSV. The previous `or` clause triggered the overwrite whenever
+        # either form was missing — which is essentially always, since CSVs
+        # use one form at a time — and silently clobbered the CSV's explicit
+        # value.
+        if hasattr(cls, "owner_id") and (
+            "user/owner_id" not in csv_reader.fieldnames
+            and "owner_id" not in csv_reader.fieldnames
+        ):
+            owner_value_overwrite = "system"
+        if hasattr(cls, "organization_id") and (
+            "organization/organization_id" not in csv_reader.fieldnames
+            and "organization_id" not in csv_reader.fieldnames
+        ):
+            if organization_id is None:
+                raise ValueError(
+                    f"{cls.__name__} is tenant-scoped but install_csv_data was "
+                    f"called without organization_id and the CSV does not "
+                    f"provide one. Use install_apps.import_csv_data() to "
+                    f"install across all orgs, or pass an explicit "
+                    f"organization_id."
+                )
+            organization_value_overwrite = str(organization_id)
+
+        return owner_value_overwrite, organization_value_overwrite
+
+    @classmethod
+    def _install_related_column(
+        cls, key: str, row: dict, db: Session, organization_id: int
+    ):
+        """
+        Install related rows for the model.
+        """
+        table_name, column_name = key.split("/")
+        # we need to remove the key anyway, this is not a real column name
+        value = row.pop(key)
+        if not value:
+            return
+        # get model from table name
+        table_model = models_pool.get(table_name, None)
+        if table_model:
+            obj = None
+            if hasattr(table_model, "organization_id"):
+                obj = (
+                    db.query(table_model)
+                    .filter_by(string_id=value, organization_id=organization_id)
+                    .first()
+                )
+            if obj is None:
+                # Fall back to an unscoped lookup so global records like the
+                # `system` user or super-org email templates can still resolve.
+                obj = db.query(table_model).filter_by(string_id=value).first()
+            if obj:
+                row[column_name] = getattr(obj, "id")
+            else:
+                logger.error(
+                    f"Object {table_name} with string_id {value} not found for org {organization_id}"
+                )
+
+    @classmethod
+    def _install_file_column(
+        cls,
+        key: str,
+        row: dict,
+        base_dir: str | None = None,
+        csv_dir: str | None = None,
+    ):
+        """
+        Install file column for the model.
+        """
+        column_name = key.split(":")[1]
+        file_path = row.pop(key)
+        if not file_path or file_path == "null":
+            return
+
+        candidates = cls._seed_file_path_candidates(
+            str(file_path),
+            base_dir=base_dir,
+            csv_dir=csv_dir,
+        )
+        resolved_path = next((path for path in candidates if path.exists()), None)
+        if resolved_path is None:
+            searched = ", ".join(str(path) for path in candidates)
+            raise FileNotFoundError(
+                f"File column {key} source not found: {file_path}. "
+                f"Searched: {searched}"
+            )
+
+        try:
+            with open(resolved_path, "r", encoding="utf-8") as file:
+                row[column_name] = file.read()
+                # check if field is JSON, if yes we load the json string
+                if (
+                    hasattr(cls, column_name)
+                    and str(getattr(cls, column_name).type) == "JSON"
+                ):
+                    row[column_name] = json.loads(row[column_name])
+        except Exception:
+            logger.error(
+                f"Error installing file column {key} with path {file_path}: {traceback.format_exc()}"
+            )
+            raise
+
+    @staticmethod
+    def _seed_file_path_candidates(
+        file_path: str,
+        base_dir: str | None = None,
+        csv_dir: str | None = None,
+    ) -> list[Path]:
+        raw_path = Path(file_path)
+        candidates: list[Path] = []
+        seen: set[str] = set()
+
+        def add(path: Path) -> None:
+            normalized = str(path)
+            if normalized not in seen:
+                candidates.append(path)
+                seen.add(normalized)
+
+        add(raw_path)
+
+        roots = [Path(root) for root in (base_dir, csv_dir) if root]
+        for root in roots:
+            add(root / raw_path)
+
+        app_roots: list[Path] = []
+        if csv_dir:
+            csv_root = Path(csv_dir)
+            if csv_root.name in {"data", "demo_data"}:
+                app_roots.append(csv_root.parent)
+        if base_dir:
+            app_roots.append(Path(base_dir))
+
+        parts = raw_path.parts
+        if not raw_path.is_absolute() and len(parts) >= 3 and parts[0] == "apps":
+            app_name = parts[1]
+            remainder = Path(*parts[2:])
+            for app_root in app_roots:
+                if app_root.name == app_name:
+                    add(app_root / remainder)
+
+        return candidates
+
+    @classmethod
+    def _install_attachment_column(
+        cls,
+        key: str,
+        row: dict,
+        db: Session,
+        organization_id: int,
+        csv_dir: str = "",
+    ):
+        """
+        Install attachment column for the model.
+
+        Supports two structures:
+        - Legacy: AttachmentModel carries AttachmentMixin (single table, file stored on create).
+        - Multi-locale: AttachmentModel is a bare container; file + metadata live on
+          AttachmentLocaleVersionModel (detected via models_pool["attachment_locale_version"]).
+        """
+        AttachmentModel = models_pool["attachment"]
+        AttachmentLocaleVersionModel = models_pool.get("attachment_locale_version")
+
+        _, field_name = key.split(":")
+        file_path = row.pop(key)
+        if not os.path.isabs(file_path) and csv_dir:
+            file_path = os.path.join(csv_dir, file_path)
+        file_name = os.path.basename(file_path)
+
+        # Prefer the row's own organization_id (resolved from CSV or slash-key) over
+        # the method arg — import_csv_data() may pass organization_id=None when the
+        # CSV provides its own org column.
+        effective_org_id = row.get("organization_id", organization_id)
+        if effective_org_id is not None:
+            effective_org_id = int(effective_org_id)
+
+        # Multi-locale path: validate org before any DB query or storage work so
+        # we never dedup against a wrong-org attachment or create orphaned records.
+        if AttachmentLocaleVersionModel:
+            if effective_org_id is None:
+                raise ValueError(
+                    f"Cannot install attachment '{file_name}': organization_id is "
+                    f"missing. Pass organization_id to install_csv_data() or include "
+                    f"organization_id / organization/organization_id in the CSV."
+                )
+            org = (
+                db.query(models_pool["organization"])
+                .filter_by(id=effective_org_id)
+                .first()
+            )
+            if org is None:
+                raise ValueError(
+                    f"Cannot install attachment '{file_name}': "
+                    f"organization id={effective_org_id} not found."
+                )
+            locale_id = getattr(org, "default_language_id", None)
+            if locale_id is None:
+                # Fallback: first locale ordered by id for determinism.
+                # No tenant filter needed — locales are global (no organization_id).
+                # Callers should set org.default_language_id to avoid this fallback.
+                LocaleModel = models_pool.get("locale")
+                if LocaleModel:
+                    first_locale = (
+                        db.query(LocaleModel).order_by(LocaleModel.id).first()
+                    )
+                    locale_id = first_locale.id if first_locale else None
+            if locale_id is None:
+                raise ValueError(
+                    f"Cannot install attachment '{file_name}' for org {effective_org_id}: "
+                    f"no locale configured. Set a default language for the organization first."
+                )
+
+        # Lookup scoped by org in multi-locale mode to prevent cross-tenant reuse.
+        # Uses a direct ORM query (not get_by_name) so bare container models without
+        # AttachmentMixin don't raise AttributeError.
+        # Contract: when attachment_locale_version is present, AttachmentModel is
+        # expected to have both `name` and `organization_id` columns (the bare-container
+        # schema used by deepsel-cms). This is intentional, not a missing guard.
+        if AttachmentLocaleVersionModel:
+            attachment_obj = (
+                db.query(AttachmentModel)
+                .filter_by(name=file_name, organization_id=effective_org_id)
+                .first()
+            )
+        else:
+            attachment_obj = db.query(AttachmentModel).filter_by(name=file_name).first()
+
+        if not attachment_obj:
+            with open(file_path, "rb") as f:
+                file_data = f.read()
+            upload_file = UploadFile(
+                file=BytesIO(file_data),
+                filename=file_name,
+                size=len(file_data),
+            )
+            system_user = (
+                db.query(models_pool["user"]).filter_by(string_id="system").first()
+            )
+            if system_user is None:
+                raise ValueError(
+                    "Cannot install attachment: 'system' user not found in the database."
+                )
+
+            if AttachmentLocaleVersionModel:
+                system_user.current_organization_id = effective_org_id
+                attachment_obj = AttachmentModel.create(
+                    db=db,
+                    user=system_user,
+                    values={"name": file_name, "organization_id": effective_org_id},
+                    bypass_permission=True,
+                    commit=False,
+                )
+                db.flush()  # populate attachment_obj.id without committing
+                AttachmentLocaleVersionModel().create(
+                    db=db,
+                    user=system_user,
+                    file=upload_file,
+                    attachment_id=attachment_obj.id,
+                    locale_id=locale_id,
+                    organization_id=effective_org_id,
+                    bypass_permission=True,
+                    commit=False,
+                )
+            else:
+                # Legacy structure: AttachmentModel handles file upload directly.
+                attachment_obj = AttachmentModel().create(
+                    db=db,
+                    user=system_user,
+                    file=upload_file,
+                    bypass_permission=True,
+                    organization_id=effective_org_id,
+                    commit=False,
+                )
+
+            logger.debug(f"Added {file_path} as attachment ID={attachment_obj.id}")
+        elif AttachmentLocaleVersionModel:
+            # Container found via dedup; ensure locale-version row exists so the
+            # parent CSV row always has file content for the target locale.
+            locale_version = (
+                db.query(AttachmentLocaleVersionModel)
+                .filter_by(attachment_id=attachment_obj.id, locale_id=locale_id)
+                .first()
+            )
+            if not locale_version:
+                with open(file_path, "rb") as f:
+                    file_data = f.read()
+                upload_file = UploadFile(
+                    file=BytesIO(file_data),
+                    filename=file_name,
+                    size=len(file_data),
+                )
+                system_user = (
+                    db.query(models_pool["user"]).filter_by(string_id="system").first()
+                )
+                if system_user is None:
+                    raise ValueError(
+                        "Cannot install attachment: 'system' user not found in the database."
+                    )
+                system_user.current_organization_id = effective_org_id
+                AttachmentLocaleVersionModel().create(
+                    db=db,
+                    user=system_user,
+                    file=upload_file,
+                    attachment_id=attachment_obj.id,
+                    locale_id=locale_id,
+                    organization_id=effective_org_id,
+                    bypass_permission=True,
+                    commit=False,
+                )
+
+        row[field_name] = attachment_obj.id
+
+    @classmethod
+    def _install_json_column(
+        cls, key: str, row: dict, db: Session, organization_id: int
+    ):
+        """
+        Install json column for the model.
+        """
+        column_name = key.split(":")[1]
+        json_str = row.pop(key)
+        if not json_str:
+            row[column_name] = json_str
+            return
+        json_obj = json.loads(json_str)
+        if hasattr(cls, column_name) and str(getattr(cls, column_name).type) in (
+            "JSON",
+            "JSONB",
+        ):
+            processed_json = cls._resolve_json_foreign_keys(
+                json_obj, db, organization_id
+            )
+            row[column_name] = processed_json
+        else:
+            # For TEXT and other non-JSON columns, store the parsed value directly
+            # so that json.dumps() applied during export is correctly reversed.
+            row[column_name] = json_obj
+
+    @classmethod
+    def _resolve_json_foreign_keys(cls, obj, db: Session, organization_id: int):
+        """
+        Recursively process a JSON object/array to resolve foreign key references.
+        Converts {table_name/column_name: string_id} to {column_name: actual_id}
+        """
+        if isinstance(obj, dict):
+            result = {}
+            for key, value in obj.items():
+                if "/" in key and key.count("/") == 1:
+                    table_name, column_name = key.split("/")
+                    table_model = models_pool.get(table_name, None)
+                    if table_model and value:
+                        foreign_obj = None
+                        if hasattr(table_model, "organization_id"):
+                            foreign_obj = (
+                                db.query(table_model)
+                                .filter_by(
+                                    string_id=value, organization_id=organization_id
+                                )
+                                .first()
+                            )
+                        if foreign_obj is None:
+                            foreign_obj = (
+                                db.query(table_model).filter_by(string_id=value).first()
+                            )
+                        if foreign_obj:
+                            result[column_name] = getattr(foreign_obj, "id")
+                        else:
+                            logger.error(
+                                f"Object {table_name} with string_id {value} not found for org {organization_id}"
+                            )
+                            result[key] = value
+                    else:
+                        result[key] = value
+                else:
+                    result[key] = cls._resolve_json_foreign_keys(
+                        value, db, organization_id
+                    )
+            return result
+        elif isinstance(obj, list):
+            return [
+                cls._resolve_json_foreign_keys(item, db, organization_id)
+                for item in obj
+            ]
+        else:
+            return obj
+
+    def _install_update_existing_record(
+        self, row: dict, db: Session, force_update: bool = False
+    ):
+        """
+        Update existing record with new data.
+        """
+        if force_update or ("system" in row and row["system"] == True) or self.system:
+            for key, value in row.items():
+                setattr(self, key, value)
+
+            db.flush()
+            logger.debug(f"Updated {self}")
+
+    @classmethod
+    def _resolve_computed_order_by(cls, root_model, query, order_by, db, user):
+        """
+        Hook for subclasses to supply a computed sort (e.g. a SQL CASE expression,
+        optionally requiring extra joins) for an order_by.field that has no direct
+        matching column. Return the modified, already-ordered query, or None to fall
+        back to the default column-lookup resolution below.
+        """
+        return None
+
+    @classmethod
+    def __apply_order_by(cls, root_model, query, order_by, db=None, user=None):
+        """
+        Apply ordering to a SQLAlchemy query based on the specified field and direction.
+        """
+        if not order_by or not order_by.field:
+            return query
+
+        computed_query = cls._resolve_computed_order_by(
+            root_model, query, order_by, db, user
+        )
+        if computed_query is not None:
+            return computed_query
+
+        field_parts = order_by.field.split(".")
+        current_alias = root_model
+
+        for part in field_parts[:-1]:
+            if not hasattr(current_alias, part):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Model {current_alias.__name__} does not have {part}",
+                )
+
+            related_model = getattr(current_alias, part)
+            if isinstance(related_model.property, RelationshipProperty):
+                onclause = related_model.property.primaryjoin
+                current_alias = models_pool.get(part, related_model.mapper.class_)
+                query = query.outerjoin(current_alias, onclause)
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"{part} is not a valid relationship in model {current_alias.__name__}",
+                )
+
+        last_field = field_parts[-1]
+        if not hasattr(current_alias, last_field):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Model {current_alias.__name__} does not have {last_field}",
+            )
+        column_to_order = getattr(current_alias, last_field)
+
+        skip_lower_trim_types = (Enum, JSON, UUID, LargeBinary, PickleType)
+
+        if isinstance(column_to_order.type, skip_lower_trim_types):
+            pass
+
+        elif isinstance(column_to_order.type, String):
+            column_to_order = func.trim(column_to_order)
+
+        if order_by.direction == "asc":
+            query = query.order_by(column_to_order.asc())
+        else:
+            query = query.order_by(column_to_order.desc())
+
+        return query

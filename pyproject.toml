@@ -1,0 +1,113 @@
+[build-system]
+requires = ["setuptools>=80.9.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deepsel"
+version = "1.9.7"
+description = "Database utilities, ORM framework, and authentication for SQLAlchemy, FastAPI Python applications"
+readme = "README.md"
+authors = [
+    {name = "Deepsel Inc.", email = "info@deepsel.com"}
+]
+license = {text = "MIT"}
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Framework :: FastAPI",
+    "Framework :: Pydantic",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+keywords = ["sqlalchemy", "database", "migration", "schema", "postgres", "deepsel", "orm", "crud"]
+requires-python = ">=3.12"
+dependencies = [
+    "sqlalchemy>=2.0.30",
+    "fastapi>=0.100.0",
+    "pydantic>=2.0.0",
+    "python-dateutil>=2.8.0",
+    "fastapi-mail>=1.0.0",
+    "httpx>=0.24.0",
+    "passlib[bcrypt]>=1.7.0",
+    # bcrypt 5.0 raises ValueError on >72-byte inputs, which passlib 1.7.x's
+    # backend probe triggers — breaking every CryptContext(schemes=["bcrypt"]).
+    # Cap below 5 until passlib ships a compatible release.
+    "bcrypt<5",
+    "strawberry-graphql[fastapi]>=0.200.0",
+    "PyJWT>=2.0.0",
+    "cryptography>=3.0",
+    "pyotp>=2.0.0",
+    "authlib>=1.0.0",
+    # Runtime-boot essentials for a consumer app: itsdangerous backs Starlette's
+    # SessionMiddleware (used by the recommended startup wiring and OAuth state),
+    # and psycopg is the primary PostgreSQL driver (postgresql+psycopg://).
+    "itsdangerous>=2.0.0",
+    "psycopg[binary]>=3.1.0",
+]
+
+[project.optional-dependencies]
+redis = [
+    "redis>=5.0.0",
+]
+s3 = [
+    "boto3>=1.26.0",
+]
+azure = [
+    "azure-storage-blob>=12.0.0",
+]
+storage = [
+    "boto3>=1.26.0",
+    "azure-storage-blob>=12.0.0",
+]
+cms = [
+    # 3.1.6 fixes CVE-2025-27516, a SandboxedEnvironment sandbox escape —
+    # anything older can bypass the SSTI mitigation this package relies on
+    # (render_wysiwyg_content.py's SandboxedEnvironment usage).
+    "Jinja2>=3.1.6",
+    "beautifulsoup4>=4.12.0",
+    "PyYAML>=6.0.0",
+    "websockets>=12.0",
+    "platformdirs>=4.0.0",
+    "requests>=2.28.0",
+]
+server = [
+    # ASGI server + dotenv config-loading a consumer app needs to boot. Not
+    # imported by the library itself, so kept out of base deps.
+    "uvicorn[standard]>=0.23.0",
+    "python-dotenv>=1.0.0",
+]
+dev = [
+    "pytest>=9.0.2",
+    "pytest-cov>=7.0.0",
+    "black>=26.1.0",
+    "flake8>=7.2.0",
+    "bandit>=1.8.0",
+    "build>=0.10.0",
+    "twine>=6.2.0",
+    "testcontainers[postgres]>=4.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/DeepselSystems/deepsel"
+Repository = "https://github.com/DeepselSystems/deepsel"
+Issues = "https://github.com/DeepselSystems/deepsel/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["deepsel*"]
+exclude = ["tests*", "examples*"]
+
+[tool.setuptools.package-data]
+deepsel = ["py.typed", "apps/*/data/*.csv", "apps/*/demo_data/*.csv", "apps/*/demo_data/attachments/*", "apps/*/templates/*.html"]
+
+[tool.black]
+line-length = 88
+target-version = ['py312']
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "deepsel/apps"]
+python_files = ["test_*.py"]
+addopts = "-v --cov=deepsel --cov-report=term-missing"

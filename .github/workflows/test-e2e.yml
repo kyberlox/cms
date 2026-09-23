@@ -1,0 +1,98 @@
+name: Deepsel - E2E Tests
+
+on:
+  workflow_call:
+  pull_request:
+    paths:
+      - 'deepsel/**'
+      - 'client/**'
+      - 'packages/**'
+      - 'themes/**'
+      - 'tests/e2e/**'
+      - 'pyproject.toml'
+      - 'Makefile'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/test-e2e.yml'
+  # no push trigger: main is covered by auto-publish.yml via workflow_call
+
+# Cancel a still-running E2E job for the same PR/branch when a new commit is
+# pushed to it — otherwise every push during iterative review reruns the
+# full job even though only the latest commit's result matters. `main` is
+# excluded from cancellation: each commit landing there (via auto-publish's
+# workflow_call) is its own point of record, so an older push shouldn't have
+# its result thrown away by a newer one arriving shortly after.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Playwright's Docker image ships Chromium + all system deps pre-installed,
+    # eliminating the slow `playwright install-deps` apt-get step (~5 min).
+    # The Docker socket is mounted so testcontainers can create the Postgres
+    # container as a sibling on the host.
+    # IMPORTANT: keep the image tag in sync with @playwright/test in package-lock.json.
+    container:
+      image: mcr.microsoft.com/playwright:v1.61.1-noble
+      options: --ipc=host -v /var/run/docker.sock:/var/run/docker.sock
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      # The Playwright Noble image ships Python 3.12 — use it directly instead
+      # of actions/setup-python, whose prebuilt binaries have shared-lib
+      # mismatches inside this container.
+      - name: Install Python build deps
+        run: apt-get update && apt-get install -y python3-pip python3-venv
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - name: Install backend (editable, with dev + server extras)
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -e ".[dev,auth,oauth,storage,server]"
+
+      - name: Install Node workspaces
+        run: npm ci
+
+      - name: Build shared packages (cms-utils, cms-react)
+        run: npm run build:packages
+
+      - name: Build admin bundle
+        run: npm run build:admin
+
+      - name: Run E2E tests
+        run: npm run e2e
+
+      # always(), not failure(): a flaky test that fails then passes on retry
+      # leaves the job's overall status green, so failure() would never upload
+      # the very retry trace/video this repo just started capturing. Empty
+      # dirs on a clean all-green run are expected — if-no-files-found: ignore
+      # keeps that from warning every time.
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: tests/e2e/playwright-report
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Upload Playwright traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-traces
+          path: tests/e2e/test-results
+          retention-days: 7
+          if-no-files-found: ignore

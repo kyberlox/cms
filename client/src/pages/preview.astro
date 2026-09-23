@@ -1,0 +1,40 @@
+---
+import '../styles/global.css';
+import { fetchPublicSettings, getDefaultBackendHost, type PageData } from '@deepsel/cms-utils';
+import { resolveThemeName } from '../utils/getThemeComponent';
+import { themeMap, themeSystemKeys } from '../themes';
+
+// getDefaultBackendHost() reads the PUBLIC_URL env var server-side (falls
+// back to http://localhost:8000) — set by tests/e2e/playwright.config.ts's
+// webServer to point e2e runs at an isolated backend instead of the shared
+// local dev backend.
+const backendHost = getDefaultBackendHost();
+const url = new URL(Astro.request.url);
+const lang = url.searchParams.get('lang') || undefined;
+const orgIdParam = url.searchParams.get('org_id');
+const orgId = orgIdParam ? Number.parseInt(orgIdParam, 10) : null;
+
+const publicSettings = await fetchPublicSettings(
+  Number.isFinite(orgId) ? orgId : null,
+  Astro.request,
+  lang,
+  backendHost,
+);
+const selectedTheme = resolveThemeName(publicSettings?.selected_theme);
+
+// Resolve the page template component directly
+const ThemeComponent =
+  themeMap[selectedTheme]?.[themeSystemKeys.Page];
+
+// Build minimal page data — will be overridden by postMessage from admin
+const pageData: PageData = {
+  slug: '/preview',
+  title: '',
+  content: '',
+  public_settings: publicSettings,
+  is_preview: true,
+  notFound: false,
+} as PageData;
+---
+
+<ThemeComponent data={pageData} />

@@ -1,0 +1,41 @@
+{
+  "name": "deepsel-monorepo",
+  "private": true,
+  "workspaces": [
+    "client",
+    "packages/*",
+    "tests/e2e"
+  ],
+  "scripts": {
+    "format": "npm run format --workspace=@deepsel/cms-utils && npm run format --workspace=@deepsel/cms-react && npm run format --workspace=@deepsel/admin",
+    "format:check": "npm run format:check --workspace=@deepsel/cms-utils && npm run format:check --workspace=@deepsel/cms-react && npm run format:check --workspace=@deepsel/admin",
+    "build:packages": "npm run build --workspace=@deepsel/cms-utils && npm run build --workspace=@deepsel/cms-react",
+    "build:admin": "npm run build:lib --workspace=@deepsel/admin",
+    "prepush:packages": "npm run prepush --workspace=@deepsel/cms-utils --workspace=@deepsel/cms-react",
+    "prepush:admin": "npm run test --workspace=@deepsel/admin && npm run build:lib --workspace=@deepsel/admin",
+    "e2e": "npm run test --workspace=tests/e2e",
+    "e2e:headed": "npm run test:headed --workspace=tests/e2e",
+    "e2e:debug": "npm run test:debug --workspace=tests/e2e",
+    "e2e:report": "npm run report --workspace=tests/e2e"
+  },
+  "overrides": {
+    "@mui/material": {
+      "react": "$react",
+      "react-dom": "$react-dom"
+    },
+    "@mui/x-data-grid": {
+      "react": "$react",
+      "react-dom": "$react-dom",
+      "@emotion/react": "$@emotion/react",
+      "@emotion/styled": "$@emotion/styled"
+    }
+  },
+  "devDependencies": {
+    "@emotion/react": "^11.14.0",
+    "@emotion/styled": "^11.14.1",
+    "happy-dom": "^20.0.11",
+    "prettier": "^3.8.1",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  }
+}

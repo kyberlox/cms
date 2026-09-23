@@ -1,0 +1,276 @@
+import logging
+
+from sqlalchemy import Column, Integer, Boolean, Text, and_, case, func
+from sqlalchemy.orm import aliased
+
+from deepsel.deps import Base
+from deepsel.orm.base_model import BaseModel
+from deepsel.orm import (
+    PAGINATION,
+    SearchQuery,
+    OrderByCriteria,
+    SearchCriteria,
+    ActivityMixin,
+)
+from deepsel.utils.models_pool import models_pool
+from sqlalchemy.orm import relationship, Session
+from fastapi import HTTPException, status
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+
+class PageModel(Base, ActivityMixin, BaseModel):
+    __tablename__ = "page"
+    __tracked_fields__ = ["published"]
+
+    @classmethod
+    def _get_activity_model(cls):
+        try:
+            ActivityModel = models_pool["activity"]
+            ActivityType = ActivityModel.__table__.c["type"].type.enum_class
+            return ActivityModel, ActivityType
+        except Exception:
+            logger.exception(
+                "Failed to resolve ActivityModel/ActivityType from models_pool"
+            )
+            raise
+
+    id = Column(Integer, primary_key=True)
+    published = Column(Boolean, default=False)
+
+    is_homepage = Column(Boolean, default=False)
+
+    # Require login to view page content
+    require_login = Column(Boolean, default=False)
+
+    # Custom code field for all languages
+    page_custom_code = Column(Text, nullable=True)
+
+    contents = relationship(
+        "PageContentModel",
+        back_populates="page",
+        cascade="all, delete-orphan",
+    )
+
+    @classmethod
+    def get_one(cls, db: Session, user, item_id: int, *args, **kwargs):
+        if user is None or not user.signed_up:
+            res = db.query(cls).get(item_id)
+            if res is None or not res.published:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Item not found",
+                )
+            return res
+        return super().get_one(db, user, item_id, *args, **kwargs)
+
+    @classmethod
+    def search(
+        cls,
+        db: Session,
+        user,
+        pagination: PAGINATION,
+        search: Optional[SearchQuery] = None,
+        order_by: Optional[OrderByCriteria] = None,
+        *args,
+        **kwargs,
+    ):
+        if user is None or not user.signed_up:
+            search = search or SearchQuery()
+            if search.AND is None:
+                search.AND = []
+            search.AND.append(
+                SearchCriteria(field="published", operator="=", value=True)
+            )
+
+        return super().search(db, user, pagination, search, order_by, *args, **kwargs)
+
+    @classmethod
+    def _resolve_computed_order_by(cls, root_model, query, order_by, db, user):
+        """
+        Sort the admin Status column to match what's actually displayed. The admin
+        Pages list shows a per-row status (Draft / Published / Published · Draft
+        pending) derived from whichever PageContentModel row matches the admin's
+        current UI language (falling back to the org's default language) — see
+        getContentForCurrentLanguage() in PageList.tsx. The raw `page.published`
+        column is a cross-locale aggregate (true if ANY locale is published) and
+        ignores has_draft entirely, so sorting by it doesn't match the badges.
+
+        order_by.context.locale_iso carries the admin's current UI language; the
+        frontend only sends it when sorting the Status column.
+        """
+        if order_by.field != "published":
+            return None
+
+        locale_iso = (order_by.context or {}).get("locale_iso")
+        if not locale_iso:
+            return None
+
+        LocaleModel = models_pool["locale"]
+        OrganizationModel = models_pool["organization"]
+        PageContentModel = models_pool["page_content"]
+
+        ui_locale_id = (
+            db.query(LocaleModel.id).filter(LocaleModel.iso_code == locale_iso).scalar()
+        )
+
+        org_id = getattr(user, "current_organization_id", None)
+        default_locale_id = None
+        if org_id is not None:
+            default_locale_id = (
+                db.query(OrganizationModel.default_language_id)
+                .filter(OrganizationModel.id == org_id)
+                .scalar()
+            )
+
+        # Content row matching the admin's UI language takes priority; the org's
+        # default-language content is the fallback when a page has no content in
+        # the UI language.
+        pc_ui = aliased(PageContentModel)
+        pc_default = aliased(PageContentModel)
+
+        query = query.outerjoin(
+            pc_ui,
+            and_(pc_ui.page_id == root_model.id, pc_ui.locale_id == ui_locale_id),
+        )
+        query = query.outerjoin(
+            pc_default,
+            and_(
+                pc_default.page_id == root_model.id,
+                pc_default.locale_id == default_locale_id,
+            ),
+        )
+
+        effective_published = func.coalesce(pc_ui.published, pc_default.published)
+        effective_has_draft = func.coalesce(pc_ui.has_draft, pc_default.has_draft)
+
+        # Mirrors the 3-state badge: Draft (0) < Published · Draft pending (1) < Published (2)
+        status_rank = case(
+            (effective_published.is_(None), 0),
+            (effective_published == False, 0),  # noqa: E712
+            (effective_has_draft == True, 1),  # noqa: E712
+            else_=2,
+        )
+
+        if order_by.direction == "asc":
+            return query.order_by(status_rank.asc())
+        return query.order_by(status_rank.desc())
+
+    @classmethod
+    def create(cls, db: Session, user, values: dict, *args, **kwargs):
+        contents = values.get("contents", [])
+        cls._normalize_contents(contents)
+        if values.get("is_homepage"):
+            cls._resolve_homepage_switch(db, current_page_id=None)
+        cls._validate_contents(db=db, contents=contents)
+        return super().create(db, user, values, *args, **kwargs)
+
+    def update(
+        self,
+        db: Session,
+        user,
+        values: dict,
+        commit: Optional[bool] = True,
+        *args,
+        **kwargs,
+    ):
+        contents = values.get("contents", [])
+        self._normalize_contents(contents)
+        if values.get("is_homepage"):
+            self._resolve_homepage_switch(db, current_page_id=self.id)
+        self._validate_contents(db=db, contents=contents)
+        return super().update(db, user, values, commit, *args, **kwargs)
+
+    @classmethod
+    def _resolve_homepage_switch(cls, db: Session, current_page_id: int = None):
+        """
+        When a page is being set as the new homepage, resolve conflicts with
+        the old homepage by unsetting its is_homepage flag and generating
+        new slugs for its contents.
+        """
+        from deepsel.apps.cms.utils.page_content import generate_slug_from_title
+
+        query = db.query(cls).filter(cls.is_homepage == True)  # noqa: E712
+        if current_page_id is not None:
+            query = query.filter(cls.id != current_page_id)
+
+        old_homepages = query.all()
+        for old_homepage in old_homepages:
+            old_homepage.is_homepage = False
+            for content in old_homepage.contents:
+                if content.slug == "/":
+                    content.slug = generate_slug_from_title(
+                        db=db,
+                        title=content.title,
+                        locale_id=content.locale_id,
+                        current_page_content_id=content.id,
+                    )
+        db.flush()
+
+    @classmethod
+    def _normalize_slug(cls, slug: str) -> str:
+        """
+        Normalize slug by ensuring it starts with a forward slash.
+        """
+        if not slug.startswith("/"):
+            return f"/{slug}"
+        return slug
+
+    @classmethod
+    def _normalize_contents(cls, contents: list[dict]):
+        """
+        Normalize all slugs in contents by ensuring they start with a forward slash,
+        and sort by locale_id.
+
+        Sorting matters once there's more than one content: each one goes
+        through PageContentModel.create/update, which takes a per-slug
+        advisory lock (see acquire_slug_lock) in whatever order this list is
+        in. Two concurrent requests touching overlapping locales in different
+        orders would lock-order-deadlock; a fixed order makes that
+        impossible.
+        """
+        for content in contents:
+            content["slug"] = cls._normalize_slug(content["slug"])
+        contents.sort(key=lambda content: content.get("locale_id") or 0)
+
+    @classmethod
+    def _validate_contents(cls, db: Session, contents: list[dict]):
+        """
+        Validate page contents for slug conflicts.
+
+        This function performs two types of validation:
+        1. Internal validation: Check for duplicate slugs within the same locale_id among the contents being validated
+        2. External validation: Check for slug conflicts with existing content in the database
+        """
+        from deepsel.apps.cms.utils.page_content import (
+            check_page_content_slug_with_conflict,
+        )
+
+        # Internal validation: Check for duplicate slugs within the same locale_id
+        slug_locale_combinations = {}
+        for i, content in enumerate(contents):
+            slug = content["slug"]
+            locale_id = content["locale_id"]
+            combination_key = (slug, locale_id)
+
+            if combination_key in slug_locale_combinations:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Duplicate slug '{slug}' found for locale_id '{locale_id}' within the same page contents",
+                )
+            slug_locale_combinations[combination_key] = i
+
+        # External validation: Check for conflicts with existing content in database
+        for content in contents:
+            is_valid, existing_content = check_page_content_slug_with_conflict(
+                db=db,
+                slug=content["slug"],
+                locale_id=content["locale_id"],
+                current_page_content_id=content.get("id", None),
+            )
+            if not is_valid:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Slug '{content['slug']}' is not valid, it is already used on '{existing_content.title} (Language: {existing_content.locale.name})'",
+                )

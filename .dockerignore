@@ -1,0 +1,16 @@
+.git
+.env
+*.log
+node_modules
+.venv
+venv
+__pycache__
+*.pyc
+.astro
+dist
+build
+cfg
+deepsel-data
+deepsel-files
+certbot
+data-dir

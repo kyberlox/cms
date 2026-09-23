@@ -1,0 +1,149 @@
+from sqlalchemy import JSON, Boolean, Column, DateTime, ForeignKey, Integer, String
+from sqlalchemy.orm import relationship
+from sqlalchemy.types import UUID
+from deepsel.deps import Base
+from deepsel.apps.core.mixins.orm import ORMBaseMixin
+from deepsel.orm.user_mixin import UserMixin
+
+
+class UserModel(Base, UserMixin, ORMBaseMixin):
+    __tablename__ = "user"
+
+    id = Column(Integer, primary_key=True)
+    string_id = Column(String, unique=True)
+
+    username = Column(String, unique=True)
+    email = Column(String, unique=True, nullable=False)
+
+    # profile fields
+    name = Column(String)
+    last_name = Column(String)
+    first_name = Column(String)
+    middle_name = Column(String)
+    title = Column(String)
+    phone = Column(String)
+    mobile = Column(String)
+    website = Column(String)
+
+    # address fields
+    street = Column(String)
+    street2 = Column(String)
+    city = Column(String)
+    state = Column(String)
+    zip = Column(String)
+    country = Column(String)
+    hashed_password = Column(String)
+    signed_up = Column(Boolean, default=False)
+    internal = Column(Boolean, default=False, nullable=False)
+    device_info = Column(JSON)
+    company_name = Column(String)
+
+    roles = relationship("RoleModel", secondary="user_role")
+    organizations = relationship(
+        "OrganizationModel", secondary="user_organization", enable_typechecks=False
+    )
+    image_id = Column(Integer, ForeignKey("attachment.id"))
+    image = relationship("AttachmentModel", foreign_keys=[image_id])
+    cv_attachment_id = Column(Integer, ForeignKey("attachment.id"))
+    cv = relationship("AttachmentModel", foreign_keys=[cv_attachment_id])
+
+    # email confirmation on signup (opt-in: consumers that don't verify leave
+    # users at the verified default, so login is unaffected)
+    email_verified = Column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
+    email_verification_code = Column(String)  # bcrypt hash of the 6-digit code
+    email_verification_code_expires = Column(DateTime)  # naive UTC
+    email_verification_attempts = Column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    email_verification_sent_at = Column(DateTime)
+
+    is_use_2fa = Column(Boolean, default=False)
+    secret_key_2fa = Column(String)
+    temp_secret_key_2fa = Column(String)
+    recovery_codes = Column(JSON, nullable=True)
+
+    anonymous_id = Column(UUID(as_uuid=True))
+    preferences = Column(JSON, default={})
+
+    # --- UserMixin settings ---
+
+    def is_public_user(self):
+        return not self.signed_up or self.string_id == "locales_public_role"
+
+    def is_admin(self):
+        roles = self.get_user_roles()
+        return any(
+            [role.string_id in ["admin_role", "website_admin_role"] for role in roles]
+        )
+
+    @classmethod
+    def _get_app_secret(cls):
+        from settings import APP_SECRET
+
+        return APP_SECRET
+
+    @classmethod
+    def _get_auth_algorithm(cls):
+        from settings import AUTH_ALGORITHM
+
+        return AUTH_ALGORITHM
+
+    @classmethod
+    def _get_frontend_url(cls):
+        # FRONTEND_URL is the canonical setting; PUBLIC_URL is accepted as a
+        # deprecated fallback so older consumer settings.py files keep working.
+        # getattr (not a bare import) so a consumer that defines neither still
+        # gets a sane default instead of an ImportError inside an email task.
+        import settings
+
+        return (
+            getattr(settings, "FRONTEND_URL", None)
+            or getattr(settings, "PUBLIC_URL", None)
+            or "http://localhost:5173"
+        )
+
+    @classmethod
+    def _get_is_authless(cls):
+        from settings import AUTHLESS
+
+        return AUTHLESS
+
+    @classmethod
+    def _get_default_org_id(cls):
+        from settings import DEFAULT_ORG_ID
+
+        return DEFAULT_ORG_ID
+
+    @classmethod
+    def _get_password_context(cls):
+        from deepsel.utils.crypto import crypt_context
+
+        return crypt_context
+
+    @classmethod
+    def _get_admin_role_string_ids(cls):
+        return ["admin_role", "website_admin_role"]
+
+    @classmethod
+    def _get_admin_user_string_id(cls):
+        return "admin_user"
+
+    @classmethod
+    def _get_set_password_template_id(cls):
+        return "setup_password_template"
+
+    @classmethod
+    def _get_reset_password_template_id(cls):
+        return "reset_password_template"
+
+    @classmethod
+    def _get_email_verification_template_id(cls):
+        return "email_confirmation_code_template"
+
+    @classmethod
+    def _get_platform_brand_name(cls):
+        import settings
+
+        return getattr(settings, "PRODUCT_NAME", None)

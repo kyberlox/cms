@@ -1,0 +1,1036 @@
+import json
+import logging
+from sqlalchemy import (
+    Enum,
+    Table,
+    UniqueConstraint,
+    inspect,
+    text,
+    Column,
+    Inspector,
+    create_engine,
+)
+from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.engine.interfaces import (
+    ReflectedColumn,
+    ReflectedIndex,
+    ReflectedForeignKeyConstraint,
+    ReflectedPrimaryKeyConstraint,
+    ReflectedUniqueConstraint,
+)
+from sqlalchemy import ForeignKey
+from sqlalchemy.orm import Session
+from sqlalchemy.orm.query import Query as SQLAlchemyQuery
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm.decl_api import DeclarativeBase
+from contextlib import contextmanager
+
+logger = logging.getLogger(__name__)
+
+
+class DatabaseManager:
+    """Manages database schema migrations and synchronization.
+
+    Automatically compares SQLAlchemy model definitions against the existing
+    database schema and applies necessary migrations including table creation,
+    column modifications, constraint updates, and cleanup of removed entities.
+
+    Args:
+        sqlalchemy_declarative_base: The SQLAlchemy declarative base containing metadata.
+        db_url: Database connection URL (e.g., 'postgresql://user:password@localhost/mydb').
+        models_pool: Dictionary mapping table names to their model classes.
+        engine_kwargs: Optional dictionary of additional arguments to pass to create_engine.
+    """
+
+    INTERNAL_TABLES = {"alembic_version", "_demo_data_installed", "auth_session"}
+
+    def __init__(
+        self,
+        sqlalchemy_declarative_base: DeclarativeBase,
+        db_url: str,
+        models_pool: dict,
+        engine_kwargs: dict | None = None,
+    ):
+        self.declarative_base = sqlalchemy_declarative_base
+        self.models_pool = models_pool
+        self.engine: Engine = create_engine(db_url, **(engine_kwargs or {}))
+        self.startup_database_update()
+
+    @contextmanager
+    def _get_session(self):
+        """Create a database session context manager."""
+
+        class Query(SQLAlchemyQuery):
+            def _set_entities(self, entities) -> None:
+                chained_entities = [
+                    (
+                        self.models_pool.get(entity.__tablename__, entity)
+                        if hasattr(entity, "__tablename__")
+                        else entity
+                    )
+                    for entity in entities
+                ]
+                super()._set_entities(chained_entities)
+
+        session = Session(self.engine, query_cls=Query)
+        try:
+            yield session
+        finally:
+            session.close()
+
+    def startup_database_update(self):
+        """Execute database schema migration on startup.
+
+        Raises:
+            Exception: If database migration fails for any reason.
+        """
+        logger.info("Database migration started ...")
+        try:
+            with self._get_session() as db:
+                self.compare_and_update_schema(db)
+                self._ensure_internal_tables(db)
+            logger.info("Database migration completed successfully")
+        except Exception as e:
+            logger.error(f"Database migration failed: {e}", exc_info=True)
+            raise
+
+    def _ensure_internal_tables(self, db: Session):
+        """Create internal framework tables if they don't exist."""
+        db.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS _demo_data_installed ("
+                "app_folder VARCHAR(255) PRIMARY KEY, "
+                "installed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+            )
+        )
+        db.commit()
+
+    def compare_and_update_schema(self, db: Session):
+        """Compare model definitions with database schema and apply updates.
+
+        Performs a comprehensive schema synchronization by:
+        - Creating new tables that exist in models but not in database
+        - Updating existing tables with schema changes
+        - Dropping tables that no longer exist in models
+        - Adding deferred foreign key constraints after all tables are created
+
+        Args:
+            db: Active database session.
+        """
+        existing_schema: dict = self.reflect_database_schema(db)
+        model_tables: list[str] = list(self.models_pool.keys())
+        engine = db.bind
+        deferred_foreign_keys = []
+
+        with engine.connect() as connection:
+            for table_name in model_tables:
+                if table_name not in existing_schema:
+                    command = text(f'CREATE TABLE "{table_name}" ();')
+                    logger.info(
+                        f"Detected new table {table_name}, creating... {command}"
+                    )
+                    connection.execute(command)
+                    connection.commit()
+                    table: Table = Table(table_name, self.declarative_base.metadata)
+                    self.update_table_schema(
+                        db, table, {}, connection, deferred_foreign_keys
+                    )
+                else:
+                    table: Table = Table(table_name, self.declarative_base.metadata)
+                    self.update_table_schema(
+                        db,
+                        table,
+                        existing_schema[table_name],
+                        connection,
+                        deferred_foreign_keys,
+                    )
+
+            for table_name in existing_schema:
+                if (
+                    table_name not in model_tables
+                    and table_name not in self.INTERNAL_TABLES
+                ):
+                    command = text(f'DROP TABLE "{table_name}" CASCADE;')
+                    logger.info(f"Detected removed table {table_name}: {command}")
+                    connection.execute(command)
+
+            for foreign_key in deferred_foreign_keys:
+                table = foreign_key["table"]
+                column = foreign_key["column"]
+                fk = foreign_key["foreign_key"]
+                referenced_table = fk.column.table.name
+                referenced_column = fk.column.name
+                fk_actions = _build_fk_actions(fk)
+                command = text(
+                    f'ALTER TABLE "{table}" ADD FOREIGN KEY ("{column}") REFERENCES "{referenced_table}" ("{referenced_column}"){fk_actions};'
+                )
+                logger.info(
+                    f'Adding foreign key for column "{column}" in table "{table}"... {command}'
+                )
+                connection.execute(command)
+
+            logger.info("Database schema updated.")
+            connection.commit()
+
+    def reflect_database_schema(
+        self, db: Session
+    ) -> dict[str, dict[str, ReflectedColumn]]:
+        """Reflect the current database schema structure.
+
+        Args:
+            db: Active database session.
+
+        Returns:
+            Dictionary mapping table names to their column definitions.
+        """
+        engine = db.bind
+        inspector: Inspector = inspect(engine)
+        existing_schema = {}
+        for table_name in inspector.get_table_names():
+            columns: list[ReflectedColumn] = inspector.get_columns(table_name)
+            existing_schema[table_name] = {col["name"]: col for col in columns}
+        return existing_schema
+
+    def update_table_schema(
+        self,
+        db: Session,
+        model_table: Table,
+        existing_table_schema: dict[str, ReflectedColumn],
+        connection: Connection,
+        deferred_foreign_keys: list | None = None,
+    ):
+        """Synchronize a single table's schema with its model definition.
+
+        Handles column additions, modifications, and removals, as well as
+        constraint updates including primary keys, foreign keys, unique
+        constraints, and indexes. Foreign keys are deferred to avoid
+        circular dependency issues.
+
+        Args:
+            db: Active database session.
+            model_table: SQLAlchemy Table object representing the model.
+            existing_table_schema: Current column definitions from the database.
+            connection: Active database connection for executing DDL statements.
+            deferred_foreign_keys: List to accumulate foreign keys for later creation.
+        """
+        if deferred_foreign_keys is None:
+            deferred_foreign_keys = []
+
+        model_columns: dict[str, Column] = {c.name: c for c in model_table.columns}
+        existing_columns: dict[str, ReflectedColumn] = existing_table_schema
+        engine = db.bind
+        inspector: Inspector = inspect(connection)
+
+        is_multitenant: bool = "organization_id" in model_columns
+
+        # Get table unique constraints.  Exclude table-level UniqueConstraints
+        # declared in __table_args__ — those are managed exclusively by
+        # _reconcile_declared_unique_constraints and must not trigger the
+        # per-column unique diff.
+        _declared_constraint_cols = {
+            frozenset(c.columns.keys())
+            for c in model_table.constraints
+            if isinstance(c, UniqueConstraint)
+            and not getattr(c, "_column_flag", False)
+            and len(c.columns) > 0
+        }
+        # ...unless a declared constraint has exactly the shape a column-level
+        # `unique=True` owns — `(col)` or, on a multi-tenant table,
+        # `(col, organization_id)`.  Hiding that one would make the per-column
+        # diff believe the constraint is missing and re-add it under a name that
+        # already exists, aborting the migration on every boot.
+        _declared_constraint_cols -= {
+            _owned_unique_shape(col_name, is_multitenant)
+            for col_name, col in model_columns.items()
+            if col.unique and col_name != "organization_id"
+        }
+        unique_constraints: list[ReflectedUniqueConstraint] = [
+            uc
+            for uc in inspector.get_unique_constraints(model_table.name)
+            if frozenset(uc["column_names"]) not in _declared_constraint_cols
+        ]
+
+        # Get table indexes, skip unique indexes since they are handled by unique
+        # constraints. Skip multi-column indexes too: the per-column `index=` flag
+        # only ever owns single-column indexes, and composite indexes (created by
+        # apps or by hand) would otherwise be matched once per constituent column
+        # and dropped.
+        indexes: list[ReflectedIndex] = [
+            index
+            for index in inspector.get_indexes(model_table.name)
+            if not index["unique"] and len(index["column_names"]) == 1
+        ]
+
+        # Get table enums
+        enums = inspector.get_enums()
+
+        # Get table foreign key constraints
+        foreign_key_constraints: list[ReflectedForeignKeyConstraint] = (
+            inspector.get_foreign_keys(model_table.name)
+        )
+        # Flattened list of column names with foreign key constraints
+        existing_foreign_keys: list[str] = [
+            column
+            for constraint in foreign_key_constraints
+            for column in constraint["constrained_columns"]
+        ]
+
+        # Get table primary key constraint
+        existing_pk_constraint: ReflectedPrimaryKeyConstraint = (
+            inspector.get_pk_constraint(model_table.name)
+        )
+        existing_primary_keys: list[str] = (
+            existing_pk_constraint["constrained_columns"] or []
+        )
+
+        # Get table primary key columns
+        model_primary_keys: list[str] = [
+            col.name for col in model_table.primary_key.columns
+        ]
+        is_composite_primary_key: bool = len(model_primary_keys) > 1
+
+        # Check if primary key has changed, and remove it if necessary
+        is_existing_pk_removed: bool = False
+        if existing_primary_keys != model_primary_keys:
+            if existing_primary_keys:
+                command = text(
+                    f'ALTER TABLE "{model_table.name}" DROP CONSTRAINT {existing_pk_constraint["name"]};'
+                )
+                connection.execute(command)
+                is_existing_pk_removed = True
+
+        for col_name, existing_column in existing_columns.items():
+            if col_name in model_columns:
+                model_column: Column = model_columns[col_name]
+                changes: list[str] = []
+                nullable: bool = model_column.nullable
+                has_unique_constraint: bool = False
+                has_index: bool = False
+
+                for constraint in unique_constraints:
+                    if _is_owned_unique_constraint(
+                        constraint["column_names"], col_name, is_multitenant
+                    ):
+                        has_unique_constraint = True
+                        break
+
+                for index in indexes:
+                    if index["column_names"] == [col_name]:
+                        has_index = True
+                        break
+
+                if model_column.foreign_keys:
+                    # This foreign key does not exist yet, add it to the list to be created later
+                    if col_name not in existing_foreign_keys:
+                        for foreign_key in model_column.foreign_keys:
+                            deferred_foreign_keys.append(
+                                {
+                                    "table": model_table.name,
+                                    "column": col_name,
+                                    "foreign_key": foreign_key,
+                                }
+                            )
+                    # This foreign key exists, update it if necessary
+                    else:
+                        foreign_key: ForeignKey | None = None
+                        for fk in model_column.foreign_keys:
+                            foreign_key = fk
+
+                        existing_foreign_key_constraint = [
+                            constraint
+                            for constraint in foreign_key_constraints
+                            if col_name in constraint["constrained_columns"]
+                        ][0]
+                        existing_referred_table = existing_foreign_key_constraint[
+                            "referred_table"
+                        ]
+                        existing_referred_column = existing_foreign_key_constraint[
+                            "referred_columns"
+                        ][0]
+                        new_referred_table = foreign_key.column.table.name
+                        new_referred_column = foreign_key.column.name
+                        if (
+                            existing_referred_table != new_referred_table
+                            or existing_referred_column != new_referred_column
+                        ):
+                            command = text(
+                                f'ALTER TABLE "{model_table.name}" DROP CONSTRAINT {existing_foreign_key_constraint["name"]};'
+                            )
+                            logger.info(
+                                f'Removing foreign key for column "{col_name}" in table "{model_table.name}"... {command}'
+                            )
+                            connection.execute(command)
+                            fk_actions = _build_fk_actions(foreign_key)
+                            command = text(
+                                f'ALTER TABLE "{model_table.name}" ADD FOREIGN KEY ("{col_name}") REFERENCES "{new_referred_table}" ("{new_referred_column}"){fk_actions};'
+                            )
+                            logger.info(
+                                f'Adding foreign key for column "{col_name}" in table "{model_table.name}"... {command}'
+                            )
+                            connection.execute(command)
+                else:
+                    if col_name in existing_foreign_keys:
+                        foreign_key_constraint_name = [
+                            constraint["name"]
+                            for constraint in foreign_key_constraints
+                            if col_name in constraint["constrained_columns"]
+                        ][0]
+                        command = text(
+                            f'ALTER TABLE "{model_table.name}" DROP CONSTRAINT {foreign_key_constraint_name};'
+                        )
+                        logger.info(
+                            f'Removing foreign key for column "{col_name}" in table "{model_table.name}"... {command}'
+                        )
+                        connection.execute(command)
+
+                old_type = existing_column["type"].compile(engine.dialect)
+                new_type = model_column.type.compile(engine.dialect)
+
+                if old_type != new_type:
+                    if old_type == "DOUBLE PRECISION" and new_type == "FLOAT":
+                        pass
+                    elif (
+                        old_type.upper() == "TSVECTOR"
+                        and new_type.upper() == "TSVECTOR"
+                    ):
+                        pass
+                    else:
+                        changes.append("TYPE")
+                if model_column.nullable != existing_column.get("nullable", True):
+                    changes.append("NULLABLE")
+                if bool(model_column.unique) != has_unique_constraint:
+                    changes.append("UNIQUE")
+                if bool(model_column.index) != has_index:
+                    changes.append("INDEX")
+                if hasattr(model_column.type, "enums") and isinstance(
+                    existing_column["type"], Enum
+                ):
+                    if model_column.type.enums != existing_column["type"].enums:
+                        changes.append("ENUM")
+
+                if "TYPE" in changes:
+                    if _is_safe_type_change(old_type, new_type):
+                        command = text(
+                            f'ALTER TABLE "{model_table.name}" ALTER COLUMN "{col_name}" TYPE {new_type} USING "{col_name}"::{new_type};'
+                        )
+                        logger.info(
+                            f'Column "{col_name}" in table "{model_table.name}" changing type safely from {old_type} to {new_type}... {command}'
+                        )
+                        connection.execute(command)
+                    elif not nullable and model_column.default is None:
+                        logger.info(
+                            f'Column "{col_name}" in table "{model_table.name}" has nullable=False, and cannot change type without a default value.'
+                        )
+                    else:
+                        logger.info(
+                            f'Column "{col_name}" in table "{model_table.name}" has changed type, dropping old column...',
+                        )
+                        command = text(
+                            f'ALTER TABLE "{model_table.name}" DROP COLUMN "{col_name}";'
+                        )
+                        connection.execute(command)
+                        existing_columns[col_name]["dropped"] = True
+                        continue
+
+                if "NULLABLE" in changes:
+                    if not model_column.nullable:
+                        if (
+                            model_column.default is None
+                            and model_column.server_default is None
+                        ):
+                            try:
+                                command = text(
+                                    f'ALTER TABLE "{model_table.name}" ALTER COLUMN "{col_name}" SET NOT NULL;'
+                                )
+                                logger.info(
+                                    f'Column "{col_name}" in table "{model_table.name}" has changed to NOT NULL without default value, attempting... {command}'
+                                )
+                                connection.execute(command)
+                            except Exception as e:
+                                logger.warning(
+                                    f'Column "{col_name}" in table "{model_table.name}" cannot be set to NOT NULL without a default value.'
+                                )
+                                logger.debug(e)
+                        elif model_column.default is not None:
+                            if isinstance(model_column.default.arg, str):
+                                default = f"'{model_column.default.arg}'"
+                            elif hasattr(model_column.type, "enums") and hasattr(
+                                model_column.default.arg, "name"
+                            ):
+                                default = f"'{model_column.default.arg.name}'"
+                            elif isinstance(model_column.default.arg, (dict, list)):
+                                default = (
+                                    f"'{json.dumps(model_column.default.arg)}'::jsonb"
+                                )
+                            else:
+                                default = model_column.default.arg
+
+                            command = text(f"""
+                                ALTER TABLE "{model_table.name}"
+                                ALTER COLUMN "{col_name}" TYPE {model_column.type.compile(engine.dialect)} USING (COALESCE("{col_name}", {default})),
+                                ALTER COLUMN "{col_name}" SET DEFAULT {default},
+                                ALTER COLUMN "{col_name}" SET NOT NULL;
+                                """)
+                            logger.info(
+                                f'Column "{col_name}" in table "{model_table.name}" has changed to NOT NULL, setting default value... {command}'
+                            )
+                            connection.execute(command)
+                        else:
+                            sd = model_column.server_default
+                            sd_text = (
+                                sd.arg.text if hasattr(sd.arg, "text") else str(sd.arg)
+                            )
+                            sd_formatted = _format_server_default(sd_text)
+                            command = text(f"""
+                                ALTER TABLE "{model_table.name}"
+                                ALTER COLUMN "{col_name}" SET DEFAULT {sd_formatted},
+                                ALTER COLUMN "{col_name}" SET NOT NULL;
+                                """)
+                            logger.info(
+                                f'Column "{col_name}" in table "{model_table.name}" has changed to NOT NULL with server_default... {command}'
+                            )
+                            connection.execute(command)
+                    else:
+                        command = text(
+                            f'ALTER TABLE "{model_table.name}" ALTER COLUMN "{col_name}" DROP NOT NULL;'
+                        )
+                        logger.info(
+                            f'Column "{col_name}" in table "{model_table.name}" has changed to NULL, dropping NOT NULL... {command}'
+                        )
+                        connection.execute(command)
+
+                if "UNIQUE" in changes:
+                    _update_existing_column_unique_constraints(
+                        model_table,
+                        unique_constraints,
+                        connection,
+                        model_columns,
+                        col_name,
+                        model_column,
+                    )
+
+                if "INDEX" in changes:
+                    if model_column.index:
+                        command = text(
+                            f'CREATE INDEX {model_table.name}_{col_name}_index ON {model_table.name} ("{col_name}");'
+                        )
+                        logger.info(
+                            f'Column "{col_name}" in table "{model_table.name}" has added index, adding... {command}'
+                        )
+                        connection.execute(command)
+                    else:
+                        # Find the actual index name for this column
+                        index_to_drop = None
+                        for index in indexes:
+                            if index["column_names"] == [col_name]:
+                                index_to_drop = index["name"]
+                                break
+
+                        if index_to_drop:
+                            command = text(f"DROP INDEX IF EXISTS {index_to_drop};")
+                            logger.info(
+                                f'Column "{col_name}" in table "{model_table.name}" has dropped index, dropping... {command}'
+                            )
+                            connection.execute(command)
+                        else:
+                            logger.warning(
+                                f'Column "{col_name}" in table "{model_table.name}" should drop index, but no index found to drop.'
+                            )
+
+                if "ENUM" in changes:
+                    existing_enum_type = existing_column["type"].compile(engine.dialect)
+                    command = ""
+                    for value in model_column.type.enums:
+                        if value not in existing_column["type"].enums:
+                            command += (
+                                f"ALTER TYPE {existing_enum_type} ADD VALUE '{value}';"
+                            )
+                    if command:
+                        logger.info(
+                            f'Updating enum type for column "{col_name}" in table "{model_table.name}": {command}'
+                        )
+                        connection.execute(text(command))
+                    if existing_enum_type != model_column.type.compile(engine.dialect):
+                        command = text(
+                            f"ALTER TYPE {existing_enum_type} RENAME TO {model_column.type.compile(engine.dialect)};"
+                        )
+                        logger.info(
+                            f'Renaming enum type for column "{col_name}" in table "{model_table.name}": {command}'
+                        )
+                        connection.execute(command)
+
+        new_columns = []
+        for col_name, model_column in model_columns.items():
+            if col_name not in existing_columns or existing_columns[col_name].get(
+                "dropped", False
+            ):
+                col_type = model_column.type.compile(engine.dialect)
+                nullable = "NULL" if model_column.nullable else "NOT NULL"
+                default = ""
+                autoincrement = ""
+                if not is_composite_primary_key:
+                    col_type = (
+                        "SERIAL PRIMARY KEY"
+                        if model_column.primary_key and col_type == "INTEGER"
+                        else col_type
+                    )
+
+                is_enum = hasattr(model_column.type, "enums")
+                if is_enum:
+                    if col_type not in [enum["name"] for enum in enums]:
+                        command = text(
+                            f"CREATE TYPE {col_type} AS ENUM {tuple(model_column.type.enums)};"
+                        )
+                        logger.info(
+                            f'Creating enum type for column "{col_name}" in table "{model_table.name}": {command}'
+                        )
+                        connection.execute(command)
+                        enums.append(
+                            {"name": col_type, "labels": model_column.type.enums}
+                        )
+                    else:
+                        command = ""
+                        existing_enum_type = [
+                            enum for enum in enums if enum["name"] == col_type
+                        ][0]
+                        existing_enum_values = existing_enum_type["labels"]
+                        for value in model_column.type.enums:
+                            if value not in existing_enum_values:
+                                command += f"ALTER TYPE {col_type} ADD VALUE '{value}';"
+                        if command:
+                            logger.info(
+                                f'Updating enum type for column "{col_name}" in table "{model_table.name}": {command}'
+                            )
+                            connection.execute(text(command))
+
+                if model_column.default is not None:
+                    default_val_type = type(model_column.default.arg)
+                    if default_val_type == str:
+                        default = f"DEFAULT '{model_column.default.arg}'"
+                    elif (
+                        default_val_type == int
+                        or default_val_type == float
+                        or default_val_type == bool
+                    ):
+                        default = f"DEFAULT {model_column.default.arg}"
+                    elif is_enum:
+                        default = f"DEFAULT '{model_column.default.arg.name}'"
+                    elif default_val_type == dict or default_val_type == list:
+                        default = (
+                            f"DEFAULT '{json.dumps(model_column.default.arg)}'::jsonb"
+                        )
+                    else:
+                        pass
+
+                if not default and model_column.server_default is not None:
+                    sd = model_column.server_default
+                    if hasattr(sd, "arg"):
+                        sd_text = (
+                            sd.arg.text if hasattr(sd.arg, "text") else str(sd.arg)
+                        )
+                        default = f"DEFAULT {_format_server_default(sd_text)}"
+
+                if model_column.primary_key and col_type == "BIGINT":
+                    autoincrement = "GENERATED ALWAYS AS IDENTITY"
+                    nullable = ""
+
+                command = text(
+                    f'ALTER TABLE "{model_table.name}" ADD COLUMN "{col_name}" {col_type} {nullable} {default} {autoincrement};'
+                )
+                logger.info(
+                    f'Adding column "{col_name}" to table "{model_table.name}": {command}'
+                )
+                new_columns.append(col_name)
+                connection.execute(command)
+
+                if model_column.index:
+                    command = text(
+                        f'CREATE INDEX {model_table.name}_{col_name}_index ON {model_table.name} ("{col_name}");'
+                    )
+                    logger.info(
+                        f'Adding index for column "{col_name}" in table "{model_table.name}": {command}'
+                    )
+                    connection.execute(command)
+
+                if model_column.unique and "organization_id" not in model_columns:
+                    single_unique_constraint = f"{model_table.name}_{col_name}_unique"
+                    command = text(
+                        f'ALTER TABLE "{model_table.name}" ADD CONSTRAINT {single_unique_constraint} UNIQUE ("{col_name}");'
+                    )
+                    logger.info(
+                        f'Adding unique constraint for column "{col_name}" in table "{model_table.name}"... {command}'
+                    )
+                    connection.execute(command)
+
+                if model_column.foreign_keys:
+                    for foreign_key in model_column.foreign_keys:
+                        deferred_foreign_keys.append(
+                            {
+                                "table": model_table.name,
+                                "column": col_name,
+                                "foreign_key": foreign_key,
+                            }
+                        )
+
+        if is_composite_primary_key and (
+            not existing_primary_keys or is_existing_pk_removed
+        ):
+            key_columns = ", ".join(model_primary_keys)
+            command = text(
+                f"ALTER TABLE {model_table.name} ADD PRIMARY KEY ({key_columns});"
+            )
+            logger.info(
+                f'Adding composite primary key for columns "{key_columns}" in table "{model_table.name}"... {command}'
+            )
+            connection.execute(command)
+
+        self._create_table_composite_unique_constrains(
+            model_table,
+            existing_table_schema,
+            connection,
+            model_columns,
+            new_columns,
+        )
+
+        self._reconcile_multitenant_unique_constraints(
+            model_table, connection, model_columns
+        )
+
+        self._reconcile_declared_unique_constraints(model_table, connection)
+
+        for col_name in existing_columns:
+            if col_name not in model_columns:
+                command = text(
+                    f'ALTER TABLE "{model_table.name}" DROP COLUMN "{col_name}";'
+                )
+                logger.info(
+                    f"Detected removed column {col_name} in table {model_table.name}: {command}",
+                )
+                connection.execute(command)
+
+    def _create_table_composite_unique_constrains(
+        self,
+        model_table: Table,
+        existing_table_schema: dict,
+        connection: Connection,
+        model_columns: dict[str, Column],
+        new_columns: list,
+    ):
+        """Create composite unique constraints for multi-tenant tables.
+
+        For tables with an organization_id column, converts single-column
+        unique constraints into composite constraints that include both
+        the original column and organization_id.
+
+        Args:
+            model_table: SQLAlchemy Table object.
+            existing_table_schema: Current schema from the database.
+            connection: Active database connection.
+            model_columns: Dictionary of model column definitions.
+            new_columns: List of newly added column names.
+        """
+        if "organization_id" not in model_columns:
+            return
+        for col_name, model_column in model_columns.items():
+            if col_name == "organization_id":
+                continue
+            if not model_column.unique:
+                continue
+
+            single_unique_constraint = f"{model_table.name}_{col_name}_unique"
+            if single_unique_constraint in existing_table_schema:
+                command = text(
+                    f'ALTER TABLE "{model_table.name}" DROP CONSTRAINT {model_table.name}_{col_name}_unique;'
+                )
+                logger.info(
+                    f'Column "{col_name}" in table "{model_table.name}" has changed to NOT UNIQUE, dropping unique constraint... {command}'
+                )
+                connection.execute(command)
+
+            composite_unique_constraint_name = (
+                f"{model_table.name}_{col_name}_organization_id_unique"
+            )
+            if col_name not in new_columns:
+                continue
+            command = text(
+                f'ALTER TABLE "{model_table.name}" ADD CONSTRAINT {composite_unique_constraint_name} UNIQUE ("{col_name}", organization_id);'
+            )
+            logger.info(
+                f'Adding composite unique constraint for columns "{col_name}" and "organization_id" in table "{model_table.name}"... {command}'
+            )
+            connection.execute(command)
+
+    def _reconcile_multitenant_unique_constraints(
+        self,
+        model_table: Table,
+        connection: Connection,
+        model_columns: dict[str, Column],
+    ):
+        """Ensure unique columns on multi-tenant tables use composite constraints.
+
+        For every column declared `unique=True` on a table that also has an
+        `organization_id` column, the unique constraint must be composite
+        `(col, organization_id)`. A pre-existing single-column constraint
+        (from legacy `ADD COLUMN ... UNIQUE`) is dropped and replaced.
+
+        Idempotent: runs on every startup, no-ops when constraints already match.
+        """
+        if "organization_id" not in model_columns:
+            return
+
+        inspector = inspect(connection)
+        current_constraints = inspector.get_unique_constraints(model_table.name)
+
+        for col_name, model_column in model_columns.items():
+            if col_name == "organization_id" or not model_column.unique:
+                continue
+
+            single_constraint_name = None
+            composite_exists = False
+            for constraint in current_constraints:
+                cols = list(constraint["column_names"])
+                if cols == [col_name]:
+                    single_constraint_name = constraint["name"]
+                elif set(cols) == {col_name, "organization_id"}:
+                    composite_exists = True
+
+            if composite_exists and not single_constraint_name:
+                continue
+
+            if single_constraint_name:
+                drop = text(
+                    f'ALTER TABLE "{model_table.name}" DROP CONSTRAINT "{single_constraint_name}";'
+                )
+                logger.info(
+                    f'Dropping single-column unique constraint "{single_constraint_name}" '
+                    f'on multi-tenant table "{model_table.name}" so it can be replaced with a composite.'
+                )
+                connection.execute(drop)
+
+            if not composite_exists:
+                composite_name = f"{model_table.name}_{col_name}_organization_id_unique"
+                add = text(
+                    f'ALTER TABLE "{model_table.name}" ADD CONSTRAINT "{composite_name}" '
+                    f'UNIQUE ("{col_name}", organization_id);'
+                )
+                logger.info(
+                    f'Adding composite unique constraint "{composite_name}" '
+                    f'on table "{model_table.name}".'
+                )
+                try:
+                    connection.execute(add)
+                except IntegrityError as e:
+                    logger.warning(
+                        f"Could not add composite unique constraint on "
+                        f'"{model_table.name}"({col_name}, organization_id): '
+                        f"existing rows violate uniqueness. Detail: {e.orig}"
+                    )
+
+    def _reconcile_declared_unique_constraints(
+        self,
+        model_table: Table,
+        connection: Connection,
+    ):
+        """Materialise table-level `UniqueConstraint`s declared in `__table_args__`.
+
+        NB-B10 / NB-D4: new tables are built with `CREATE TABLE "x" ();` plus one
+        `ALTER TABLE ... ADD COLUMN` per column, so only *column-level*
+        `unique=True` ever reached Postgres. A composite constraint such as
+        `UniqueConstraint("visit_id", "equipment_id", name="uq_visit_equipment")`
+        was declared on the model and silently never created — every composite
+        constraint in a consumer app was decorative.
+
+        Only adds what is missing; declared constraints are never dropped, and a
+        constraint the existing rows would violate is logged and skipped (inside
+        a SAVEPOINT) rather than aborting the whole migration.
+        """
+        declared = [
+            constraint
+            for constraint in model_table.constraints
+            if isinstance(constraint, UniqueConstraint)
+            # `_column_flag` marks the implicit constraint SQLAlchemy synthesises
+            # for `Column(..., unique=True)` — that one is handled above, and on
+            # a multi-tenant table it must become composite with organization_id.
+            and not getattr(constraint, "_column_flag", False)
+            and len(constraint.columns) > 0
+        ]
+        if not declared:
+            return
+
+        inspector = inspect(connection)
+        current_constraints = inspector.get_unique_constraints(model_table.name)
+        existing_column_sets = {
+            frozenset(constraint["column_names"]) for constraint in current_constraints
+        }
+        existing_names = {constraint["name"] for constraint in current_constraints}
+
+        for constraint in declared:
+            col_names = [column.name for column in constraint.columns]
+            if frozenset(col_names) in existing_column_sets:
+                continue
+            name = constraint.name or (
+                f"{model_table.name}_{'_'.join(col_names)}_unique"
+            )
+            if name in existing_names:
+                continue
+
+            columns_sql = ", ".join(f'"{col_name}"' for col_name in col_names)
+            command = text(
+                f'ALTER TABLE "{model_table.name}" ADD CONSTRAINT "{name}" '
+                f"UNIQUE ({columns_sql});"
+            )
+            logger.info(
+                f'Adding declared unique constraint "{name}" on table '
+                f'"{model_table.name}" ({", ".join(col_names)})... {command}'
+            )
+            try:
+                with connection.begin_nested():
+                    connection.execute(command)
+            except IntegrityError as e:
+                logger.warning(
+                    f'Could not add unique constraint "{name}" on '
+                    f'"{model_table.name}" ({", ".join(col_names)}): existing rows '
+                    f"violate uniqueness. Detail: {e.orig}"
+                )
+            else:
+                existing_column_sets.add(frozenset(col_names))
+                existing_names.add(name)
+
+
+def _owned_unique_shape(col_name: str, is_multitenant: bool) -> frozenset[str]:
+    """Column set of the unique constraint that `Column(unique=True)` owns.
+
+    Single-column `(col)` on a plain table; composite `(col, organization_id)`
+    on a multi-tenant one.
+    """
+    if is_multitenant:
+        return frozenset({col_name, "organization_id"})
+    return frozenset({col_name})
+
+
+def _is_owned_unique_constraint(
+    column_names: list[str], col_name: str, is_multitenant: bool
+) -> bool:
+    """Whether a reflected unique constraint belongs to `col_name`'s flag.
+
+    A single-column `(col)` always counts (it is the legacy shape on tenant
+    tables), and so does `(col, organization_id)` in either column order on a
+    multi-tenant table.  Wider composites — declared in `__table_args__` or
+    created by hand — are never owned by a column flag, so a stale
+    `unique=False` must not drop them and a `unique=True` is not satisfied by
+    them.
+    """
+    cols = set(column_names)
+    if cols == {col_name}:
+        return True
+    return is_multitenant and cols == {col_name, "organization_id"}
+
+
+_SQL_FUNCTION_PATTERN = ("(", "::", " ")
+
+
+def _format_server_default(sd_text: str) -> str:
+    """Format a server_default value for SQL. Quotes plain literals, passes SQL expressions through."""
+    if any(c in sd_text for c in _SQL_FUNCTION_PATTERN):
+        return sd_text
+    return f"'{sd_text}'"
+
+
+_STRING_TYPE_PREFIXES = ("VARCHAR", "CHARACTER VARYING", "TEXT", "CHAR(")
+
+
+def _is_safe_type_change(old_type: str, new_type: str) -> bool:
+    """Check if a column type change can be done with ALTER TYPE (no data loss).
+
+    Safe changes: VARCHAR length changes, TEXT <-> VARCHAR conversions.
+    """
+    old_upper = old_type.upper()
+    new_upper = new_type.upper()
+    old_is_string = any(
+        old_upper.startswith(p) or old_upper == p.rstrip("(")
+        for p in _STRING_TYPE_PREFIXES
+    )
+    new_is_string = any(
+        new_upper.startswith(p) or new_upper == p.rstrip("(")
+        for p in _STRING_TYPE_PREFIXES
+    )
+    return old_is_string and new_is_string
+
+
+def _build_fk_actions(fk: ForeignKey) -> str:
+    """Build ON DELETE / ON UPDATE clause for a foreign key."""
+    actions = ""
+    if fk.ondelete:
+        actions += f" ON DELETE {fk.ondelete}"
+    if fk.onupdate:
+        actions += f" ON UPDATE {fk.onupdate}"
+    return actions
+
+
+def _update_existing_column_unique_constraints(
+    model_table: Table,
+    existing_unique_constraints: list[dict],
+    connection: Connection,
+    model_columns: dict,
+    col_name: str,
+    model_column,
+):
+    """Update unique constraints for a column based on model definition.
+
+    Handles both addition and removal of unique constraints. For multi-tenant
+    tables (containing organization_id), creates composite unique constraints.
+    Otherwise, manages single-column unique constraints.
+
+    Args:
+        model_table: SQLAlchemy Table object.
+        existing_unique_constraints: Current unique constraints from the database.
+        connection: Active database connection.
+        model_columns: Dictionary of all model column definitions.
+        col_name: Name of the column being updated.
+        model_column: SQLAlchemy Column object for the column.
+
+    Raises:
+        IntegrityError: If adding a unique constraint fails due to duplicate values.
+    """
+
+    if model_column.unique:
+        if "organization_id" in model_columns:
+            constraint_name = f"{model_table.name}_{col_name}_organization_id_unique"
+            command = text(
+                f'ALTER TABLE "{model_table.name}" ADD CONSTRAINT {constraint_name} UNIQUE ("{col_name}", organization_id);'
+            )
+        else:
+            constraint_name = f"{model_table.name}_{col_name}_unique"
+            command = text(
+                f'ALTER TABLE "{model_table.name}" ADD CONSTRAINT {constraint_name} UNIQUE ("{col_name}");'
+            )
+
+        logger.info(
+            f'Column "{col_name}" in table "{model_table.name}" has changed to UNIQUE, attempting to add unique constraint... {command}'
+        )
+        try:
+            connection.execute(command)
+        except IntegrityError as e:
+            logger.warning(
+                f'Column "{col_name}" in table "{model_table.name}" cannot be set to UNIQUE, it may contain duplicate values.'
+            )
+            message = str(e.orig)
+            detail = message.split("DETAIL:  ")[1]
+            logger.warning(detail)
+
+    else:
+        is_multitenant = "organization_id" in model_columns
+        for constraint in existing_unique_constraints:
+            # Drop every constraint this column's flag owns: the composite on a
+            # multi-tenant table, plus any legacy single-column one.
+            if _is_owned_unique_constraint(
+                constraint["column_names"], col_name, is_multitenant
+            ):
+                unique_constraint_name = constraint["name"]
+                command = text(
+                    f'ALTER TABLE "{model_table.name}" DROP CONSTRAINT {unique_constraint_name};'
+                )
+                logger.info(
+                    f'Column "{col_name}" in table "{model_table.name}" has changed to NOT UNIQUE, dropping unique constraint... {command}'
+                )
+                connection.execute(command)
