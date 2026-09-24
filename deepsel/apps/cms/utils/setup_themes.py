@@ -45,8 +45,9 @@ def _get_user_shell():
     )
 
 
-def _run_npm(cmd, cwd, timeout=300):
+def _run_npm(cmd, cwd, timeout=None):
     """Run npm command through user's interactive shell to inherit PATH."""
+    timeout = timeout or int(os.getenv("THEME_NPM_TIMEOUT", "900"))
     user_shell = _get_user_shell()
     return subprocess.run(  # nosec B603
         [user_shell, "-i", "-c", cmd],
@@ -171,7 +172,11 @@ def build_in_dir(data_dir, run_install=True, run_build=True):
 
     if run_build:
         logger.info("Running client build...")
-        build_result = _run_npm("npm run build", cwd=data_dir, timeout=600)
+        build_result = _run_npm(
+            "npm run build",
+            cwd=data_dir,
+            timeout=int(os.getenv("THEME_BUILD_TIMEOUT", "1800")),
+        )
 
         if build_result.returncode != 0:
             error_output = build_result.stdout + "\n" + build_result.stderr

@@ -524,7 +524,12 @@ def upgrade(db, from_version, to_version):
     else:
         from .utils.setup_themes import setup_themes
 
-        setup_themes(selected_theme=selected_theme)
+        try:
+            setup_themes(selected_theme=selected_theme)
+        except Exception as e:
+            # A failed rebuild must not block serving: if a previous build left a
+            # usable dist, the client below starts anyway (and the next boot retries).
+            logger.error(f"Theme setup failed (will retry on next boot): {e}")
 
     # Start the Astro client after themes are built
     from .utils.client_process import get_client_manager
