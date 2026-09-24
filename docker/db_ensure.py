@@ -32,6 +32,11 @@ def ident(value: str) -> str:
     return f'"{value.replace(chr(34), chr(34) * 2)}"'
 
 
+def literal(value: str) -> str:
+    """SQL string literal (safe against embedded single quotes)."""
+    return "'" + value.replace("'", "''") + "'"
+
+
 if not (POSTGRES_USER and POSTGRES_PASSWORD and DB_USER and DB_PASSWORD):
     print("[db_ensure] skipping: POSTGRES_*/DB_* credentials not fully set")
     raise SystemExit(0)
@@ -51,14 +56,16 @@ with engine.connect() as conn:
     ).scalar()
     if not exists:
         conn.execute(
-            text(f'CREATE ROLE {ident(DB_USER)} LOGIN PASSWORD :p'), {"p": DB_PASSWORD}
+            text(f'CREATE ROLE {ident(DB_USER)} LOGIN PASSWORD {literal(DB_PASSWORD)}')
         )
         print(f"[db_ensure] created role {DB_USER}")
     else:
-        conn.execute(
-            text(f'ALTER ROLE {ident(DB_USER)} WITH LOGIN PASSWORD :p'),
-            {"p": DB_PASSWORD},
-        )
+        try:
+            conn.execute(
+                text(f'ALTER ROLE {ident(DB_USER)} WITH LOGIN PASSWORD {literal(DB_PASSWORD)}')
+            )
+        except Exception as exc:  # noqa: BLE001 - ALTER is best-effort
+            print(f"[db_ensure] WARNING: could not sync password for {DB_USER}: {exc}")
         print(f"[db_ensure] role {DB_USER} ready (password synced)")
 
     # --- database ----------------------------------------------------------
