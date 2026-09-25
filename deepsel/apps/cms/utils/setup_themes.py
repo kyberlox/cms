@@ -172,6 +172,18 @@ def build_in_dir(data_dir, run_install=True, run_build=True):
 
     if run_build:
         logger.info("Running client build...")
+
+        # Stash the current dist so an interrupted build (OOM, crash) can never
+        # corrupt a previously working client. On failure we restore it and the
+        # site keeps serving until the next successful build.
+        build_dir = os.path.join(data_dir, "client", "dist")
+        backup_dir = os.path.join(data_dir, "client", "dist.bak")
+        if os.path.isdir(build_dir) and not os.path.exists(backup_dir):
+            try:
+                shutil.copytree(build_dir, backup_dir)
+            except Exception as exc:  # noqa: BLE001 - best-effort backup
+                logger.warning(f"Could not backup existing dist: {exc}")
+
         build_result = _run_npm(
             "npm run build",
             cwd=data_dir,
@@ -180,11 +192,18 @@ def build_in_dir(data_dir, run_install=True, run_build=True):
 
         if build_result.returncode != 0:
             error_output = build_result.stdout + "\n" + build_result.stderr
-            logger.error(f"Client build failed: {error_output}")
+            logger.error(f"Client build failed: {error_output[0:4000]}")
+            # Restore the previous working client so it keeps serving.
+            if os.path.isdir(backup_dir):
+                shutil.rmtree(build_dir, ignore_errors=True)
+                shutil.copytree(backup_dir, build_dir)
+                logger.warning("Restored previous client build from dist.bak")
             raise RuntimeError(
-                f"npm build failed with exit code {build_result.returncode}: {error_output}"
+                f"npm build failed with exit code {build_result.returncode}: {error_output[0:4000]}"
             )
         else:
+            if os.path.isdir(backup_dir):
+                shutil.rmtree(backup_dir, ignore_errors=True)
             logger.info("Client build completed successfully")
     else:
         logger.info("Build artifacts up to date; skipping client build")
