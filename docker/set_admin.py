@@ -31,7 +31,7 @@ if not password and not email and username == "admin":
     raise SystemExit(0)
 
 try:
-    from sqlalchemy import create_engine
+    from sqlalchemy import create_engine, text
     from sqlalchemy.orm import Session
 except ImportError:
     create_engine = None
@@ -56,7 +56,7 @@ SET {", ".join(f'"{k}" = :{k}' for k in updates)}
 WHERE string_id = 'admin_user'
 """
 with Session(engine) as db:
-    result = db.execute(sql, updates)
+    result = db.execute(text(sql), updates)
     db.commit()
     print(f"[set_admin] updated {result.rowcount} row(s) for admin_user")
 engine.dispose()
