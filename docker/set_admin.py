@@ -11,6 +11,13 @@ The row is matched by its stable `string_id` (`admin_user`).
 """
 
 import os
+import sys
+
+# The app code (settings.py, db.py) lives in the image WORKDIR (/app). When this
+# script is run directly (docker compose exec ... python /usr/local/bin/set_admin.py)
+# its own directory is on sys.path instead of cwd, so make the app dir importable.
+sys.path.insert(0, os.getcwd())
+sys.path.insert(0, "/app")
 
 from passlib.context import CryptContext
 
